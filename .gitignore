@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+loudness.json
+config.json
+.DS_Store
+Thumbs.db

@@ -4,15 +4,22 @@
 
 <h1 align="center">海王音乐播放器</h1>
 
-<p align="center">libmpv + egui 写的 Windows 桌面音乐播放器 · 纯本地 · 约 12 MB · 解压即用</p>
+<p align="center">libmpv + egui 写的桌面音乐播放器 · 纯本地 · Windows 解压即用 · 也可跑在银河麒麟 / Linux</p>
 
 ---
 
 从 [BYD-AplayerFoliaMix](https://github.com/744733778/BYD-AplayerFoliaMix) 提炼的最小桌面原型。只保留最必要的能力，重点做好**歌词**：多源在线匹配、取匹配度最高的歌词，保存到音频同目录。
 
-- **成品下载**：见 [Releases](../../releases) —— `海王音乐播放器-win64-v4.zip`（内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` + 使用说明）
+### 下载
+
+| 平台 | 文件 | 说明 |
+| --- | --- | --- |
+| Windows 7 / 10 / 11 (64 位) | [Releases](../../releases) 里的 `haiwang-music-player-win64-v4.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
+| 银河麒麟 V10 SP1 (x86_64) | `haiwang-music_0.1.0-2_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
+| 银河麒麟 / 其它 Linux | `rust-music-x86_64.appimage` | 免安装单文件，跑前 `chmod +x` |
+
 - **项目图标**：`icon.png`
-- **支持系统**：Windows 7 / 10 / 11（64 位）
+- **麒麟 / Linux 版说明**：构建方式、依赖取舍、排障见 [`kylin/README.md`](kylin/README.md) 与 [`kylin/run-on-kylin.md`](kylin/run-on-kylin.md)
 
 ## 已实现
 
@@ -71,6 +78,20 @@ egui 的 `show_viewport_immediate + with_transparent(true)` 在 Windows 上**不
 `libmpv-2.dll` 可从 [mpv 官方 Windows 构建的 dev 包](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)（`mpv-dev-x86_64-*.7z`）或 MSYS2 的 `mingw-w64-x86_64-mpv` 中提取。
 
 不过官方那种包是「什么都有」的全量构建，解压出来的 `libmpv-2.dll` **122 MB**（`.text` 就 97 MB），对一个只放歌的程序太重。仓库发布包里带的是自编译精简版，**5.7 MB**，见下节。
+
+## 银河麒麟 / Linux 发行版
+
+基于 `ubuntu:20.04`（glibc 2.31，与麒麟 V10 SP1 对齐）构建，图形后端是 `glow`（OpenGL），**不依赖 wgpu / Vulkan**，因此能跑在只有基础 OpenGL 的风华显卡上。
+
+| 形态 | 大小 | 依赖策略 |
+| --- | --- | --- |
+| `.deb` 离线包 | ~81 MB | libmpv + 完整 ffmpeg 链、X11/xcb/wayland、字体栈、alsa/jack 共 280 个库私有化到 `/opt/haiwang-music/lib`；**不写 `/usr/lib`、`/lib`、`/etc/ld.so*`**，不碰系统包 |
+| `.AppImage` | ~90 MB | 内置 libmpv + ffmpeg + 文泉驿中文字体；GUI/显卡栈交给目标系统 |
+| 原始 ELF | ~15 MB | 需系统自带 `libmpv.so.2` |
+
+两者都**不打包 glibc**（兼容性前提）、**不打包 `libGL/libEGL/libGLX/libdrm`**（必须由显卡驱动提供，打包反而破坏加速）。主程序最高只需 `GLIBC_2.30`。
+
+构建脚本、依赖闭包收集、dpkg 装/卸演练结论见 [`kylin/README.md`](kylin/README.md)，运行与排障（FUSE、OpenGL、字体、音频）见 [`kylin/run-on-kylin.md`](kylin/run-on-kylin.md)。
 
 ## 精简版 libmpv 是怎么编出来的
 

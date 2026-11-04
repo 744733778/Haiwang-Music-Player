@@ -6,7 +6,7 @@ use crate::mpv::Mpv;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 等响度后台线程回报
 enum LoudMsg {
@@ -17,7 +17,59 @@ enum LoudMsg {
 
 /// 桌面歌词窗口的稳定标题（仅 egui 子 viewport 路径使用）
 #[cfg(not(windows))]
-pub const LYRIC_WINDOW_TITLE: &str = "rust-music-desktop-lyric";
+pub const LYRIC_WINDOW_TITLE: &str = "hwplayer-desktop-lyric";
+
+/// 内置目录浏览器（兜底）：系统没有 zenity / kdialog 等原生选择器时使用
+pub struct DirBrowser {
+    dir: PathBuf,
+    entries: Vec<PathBuf>,
+    err: Option<String>,
+}
+
+impl DirBrowser {
+    fn new(start: PathBuf) -> Self {
+        let mut b = Self {
+            dir: start,
+            entries: Vec::new(),
+            err: None,
+        };
+        b.refresh();
+        b
+    }
+
+    /// 重新列出当前目录下的子目录（只保留目录，跳过隐藏项）
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.err = None;
+        match std::fs::read_dir(&self.dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let hidden = e
+                        .file_name()
+                        .to_str()
+                        .map(|n| n.starts_with('.'))
+                        .unwrap_or(false);
+                    if hidden {
+                        continue;
+                    }
+                    self.entries.push(p);
+                }
+                self.entries
+                    .sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            }
+            Err(e) => self.err = Some(format!("无法读取目录：{}", e)),
+        }
+    }
+
+    fn goto(&mut self, p: PathBuf) {
+        self.dir = p;
+        self.refresh();
+    }
+}
 
 pub struct App {
     cfg: Config,
@@ -40,6 +92,10 @@ pub struct App {
 
     dl_rx: Option<Receiver<String>>,
     scan_rx: Option<Receiver<Vec<Song>>>,
+    /// 系统文件夹选择器（子进程）的异步结果：Ok(None) = 用户取消
+    pick_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    /// 内置目录浏览器：仅当系统没有任何原生文件选择器时兜底
+    browser: Option<DirBrowser>,
     /// 等响度测量结果缓存
     loud_store: crate::loudness::Store,
     /// 响度扫描/单曲测量的回报
@@ -49,7 +105,10 @@ pub struct App {
 
     seeking: bool,
     seek_value: f64,
-    last_eof: bool,
+    /// 刚切歌后短时间内忽略残余的结束事件，防止连锁跳歌
+    eof_guard_until: Option<Instant>,
+    /// 本曲的“播放结束”是否已处理过（每曲只切一次）
+    ended_for_track: bool,
 
     show_settings: bool,
     /// 桌面歌词窗口位置只在首帧设置，之后交给系统拖动，避免每帧回写导致抖动/不跟手
@@ -91,12 +150,15 @@ impl App {
             status: "就绪。选择一个音乐文件夹开始。".to_string(),
             dl_rx: None,
             scan_rx: None,
+            pick_rx: None,
+            browser: None,
             loud_store: crate::loudness::Store::load(),
             loud_rx: None,
             applied_gain: None,
             seeking: false,
             seek_value: 0.0,
-            last_eof: false,
+            eof_guard_until: None,
+            ended_for_track: false,
             show_settings: false,
             original_order: None,
             #[cfg(not(windows))]
@@ -162,6 +224,47 @@ impl App {
                 self.load_lyrics_for(&s);
             }
             self.status = format!("扫描完成，曲库共 {} 首。", self.songs.len());
+        }
+    }
+
+    /// 打开系统自带的文件夹选择器（后台线程，避免阻塞界面）。
+    /// 若系统没有任何原生选择器，自动退到内置目录浏览器。
+    fn start_pick_folder(&mut self) {
+        if self.pick_rx.is_some() || self.browser.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pick_folder());
+        });
+        self.pick_rx = Some(rx);
+        self.status = "正在打开系统文件选择器…".to_string();
+    }
+
+    fn poll_pick_folder(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pick_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(Ok(Some(p))) => {
+                self.folder_input = p.to_string_lossy().into_owned();
+                self.import_folder(p);
+            }
+            Ok(Ok(None)) => {
+                self.status = "已取消选择。".to_string();
+            }
+            Ok(Err(msg)) => {
+                // 系统缺少原生选择器 → 用内置浏览器兜底，保证任何环境都能选目录
+                self.status = msg;
+                let start = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+                self.browser = Some(DirBrowser::new(start));
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // 选择器还开着，放回去继续等
+                self.pick_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = "系统文件选择器已退出。".to_string();
+            }
         }
     }
 
@@ -240,7 +343,9 @@ impl App {
         };
         self.position = 0.0;
         self.playing = true;
-        self.last_eof = false;
+        self.ended_for_track = false;
+        // loadfile 是异步的：给 mpv 600ms 完成切换，期间不判定结束
+        self.eof_guard_until = Some(Instant::now() + Duration::from_millis(600));
         self.last_scrolled = None;
         self.load_lyrics_for(&song);
         self.status = format!("正在播放：{}", song.display());
@@ -442,8 +547,13 @@ impl App {
     }
 
     fn poll_mpv(&mut self) {
-        let (pos, dur, paused, eof) = match &self.mpv {
-            Some(m) => (m.time_pos(), m.duration(), m.paused(), m.eof_reached()),
+        let (pos, dur, paused, ev_ended) = match &self.mpv {
+            Some(m) => (
+                m.time_pos(),
+                m.duration(),
+                m.paused(),
+                m.take_end_file(),
+            ),
             None => return,
         };
         self.position = pos;
@@ -453,14 +563,44 @@ impl App {
         if self.current.is_some() {
             self.playing = !paused;
         }
-        if eof && !self.last_eof {
-            self.last_eof = true;
-            if self.current.is_some() {
-                self.next();
+
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 40 == 0 {
+                eprintln!(
+                    "[poll] pos={:.2} dur={:.2} paused={} ev_ended={}",
+                    pos, dur, paused, ev_ended
+                );
             }
-        } else if !eof {
-            self.last_eof = false;
         }
+
+        // 播放结束的两个判据：
+        //  a) END_FILE 事件（某些版本的 libmpv 会发）
+        //  b) 进度到结尾 + mpv 自动暂停——keep-open=yes 的标准表现。
+        //     focal 的 libmpv 0.32 实测只走 b)，不会发 END_FILE。
+        let reached_end = dur > 0.5 && pos >= dur - 0.2 && paused;
+        if !(ev_ended || reached_end) {
+            return;
+        }
+        if self.current.is_none() || self.ended_for_track {
+            return;
+        }
+        // 刚切歌的 600ms 内不判定，避免把上一曲的收尾状态当成新曲播完
+        if let Some(until) = self.eof_guard_until {
+            if Instant::now() < until {
+                return;
+            }
+        }
+        self.eof_guard_until = None;
+        self.ended_for_track = true;
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            if let Some(i) = self.current {
+                let name = self.songs.get(i).map(|s| s.display()).unwrap_or_default();
+                eprintln!("[advance] from={} song={}", i, name);
+            }
+        }
+        self.next();
     }
 
     // ---------------- 歌词 ----------------
@@ -629,20 +769,25 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("音乐文件夹：");
-                ui.add_sized(
+                let resp = ui.add_sized(
                     [420.0, 24.0],
                     egui::TextEdit::singleline(&mut self.folder_input)
                         .hint_text("输入或粘贴文件夹路径"),
                 );
-                #[cfg(windows)]
-                if ui.button("浏览…").clicked() {
-                    if let Some(p) = pick_folder() {
-                        self.folder_input = p.to_string_lossy().into_owned();
-                        self.import_folder(p);
-                    }
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                let picking = self.pick_rx.is_some();
+                if ui
+                    .add_enabled(!picking, egui::Button::new("浏览…"))
+                    .on_hover_text("调用系统自带的文件夹选择器")
+                    .clicked()
+                {
+                    self.start_pick_folder();
+                    ui.ctx().request_repaint();
                 }
-                if ui.button("导入").clicked() {
-                    let p = PathBuf::from(self.folder_input.trim());
+                if ui.button("导入").clicked() || enter {
+                    let p = normalize_input_path(&self.folder_input);
+                    self.folder_input = p.to_string_lossy().into_owned();
                     self.import_folder(p);
                 }
                 let scanning = self.scan_rx.is_some();
@@ -1144,6 +1289,80 @@ impl App {
         });
     }
 
+    /// 内置目录浏览器：系统没有 zenity/kdialog 时的兜底，纯 egui 实现、零外部依赖
+    fn draw_browser(&mut self, ctx: &egui::Context) {
+        let Some(mut b) = self.browser.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut cancelled = false;
+        let mut nav: Option<PathBuf> = None;
+        let mut chosen: Option<PathBuf> = None;
+
+        egui::Window::new("选择音乐文件夹")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([540.0, 440.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⬆ 上级").clicked() {
+                        if let Some(p) = b.dir.parent() {
+                            nav = Some(p.to_path_buf());
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(b.dir.to_string_lossy().to_string())
+                            .monospace()
+                            .size(12.0),
+                    );
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(e) = &b.err {
+                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                        }
+                        if b.entries.is_empty() && b.err.is_none() {
+                            ui.label("（没有子文件夹）");
+                        }
+                        for e in &b.entries {
+                            let name = e
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if ui.selectable_label(false, format!("📁 {}", name)).clicked() {
+                                nav = Some(e.clone());
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("选择此文件夹").clicked() {
+                        chosen = Some(b.dir.clone());
+                    }
+                    if ui.button("取消").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if let Some(p) = nav {
+            b.goto(p);
+        }
+        let picked = chosen.is_some();
+        if let Some(p) = chosen {
+            self.folder_input = p.to_string_lossy().into_owned();
+            self.import_folder(p);
+        }
+        let keep = open && !cancelled && !picked;
+        if keep {
+            self.browser = Some(b);
+        }
+    }
+
     #[cfg(not(windows))]
     fn lyric_viewport_id(&self) -> Option<egui::ViewportId> {
         if self.cfg.lyric.visible {
@@ -1232,7 +1451,7 @@ impl App {
                     .current
                     .and_then(|i| self.songs.get(i))
                     .map(|s| format!("♪ {}", s.title))
-                    .unwrap_or_else(|| "♪ Rust Music".to_string());
+                    .unwrap_or_else(|| "♪ hwplayer".to_string());
                 lines.push(crate::lyric_win32::Line {
                     text: title,
                     size: lw.font_size,
@@ -1285,7 +1504,7 @@ impl App {
                     .current
                     .and_then(|i| self.songs.get(i))
                     .map(|s| format!("♪ {}", s.title))
-                    .unwrap_or_else(|| "♪ Rust Music".to_string());
+                    .unwrap_or_else(|| "♪ hwplayer".to_string());
                 (fallback, 0.0, None, String::new())
             }
         };
@@ -1432,6 +1651,23 @@ impl eframe::App for App {
         self.poll_download();
         self.poll_loudness();
         self.poll_scan();
+        self.poll_pick_folder(ctx);
+
+        // 支持把文件夹直接拖进窗口：与「浏览…」等价，走系统拖放
+        if self.browser.is_none() && self.pick_rx.is_none() {
+            let dropped: Option<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .find(|p| p.is_dir())
+            });
+            if let Some(p) = dropped {
+                self.folder_input = p.to_string_lossy().into_owned();
+                self.import_folder(p);
+            }
+        }
+
         self.lyric_index = self.current_lyric_index(self.pos_ms());
 
         #[cfg(not(windows))]
@@ -1446,6 +1682,7 @@ impl eframe::App for App {
         self.draw_song_list(ctx);
         self.draw_center(ctx);
         self.draw_settings(ctx);
+        self.draw_browser(ctx);
         self.draw_lyric_window(ctx);
 
         // 播放中把重绘提到 20fps：桌面歌词窗靠插值走逐字高亮，
@@ -1535,7 +1772,184 @@ fn shuffle<T>(v: &mut [T]) {
     }
 }
 
-#[cfg(windows)]
-fn pick_folder() -> Option<PathBuf> {
-    rfd::FileDialog::new().pick_folder()
+// ---------------- 文件夹选择 ----------------
+
+/// 调用系统自带的文件夹选择器。
+///
+/// Linux 没有跨桌面的统一选择器 API，这里按「系统自带程序」依次尝试：
+/// `zenity`(GTK) → `kdialog`(KDE/UKUI) → `yad` → `qarma`。
+///
+/// 用子进程而不是链接 GTK/Qt：我方 deb/AppImage 把运行时库私有化在
+/// `/opt/haiwang-music/lib`，一旦链接 libgtk-3 就得连带打包整套 GTK，
+/// 反而与目标机桌面自带的 GTK 冲突。子进程方式零链接依赖、天然隔离。
+///
+/// `Ok(None)` = 用户主动取消；`Err(msg)` = 系统没有可用选择器（由调用方兜底）。
+fn pick_folder() -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        Ok(rfd::FileDialog::new().pick_folder())
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+
+        let start = dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string());
+
+        // (程序名, 参数)。统一成 Vec<String> 以兼容 kdialog 的 `--title X` 风格
+        let candidates: [(&str, Vec<String>); 4] = [
+            (
+                "zenity",
+                vec![
+                    "--file-selection".into(),
+                    "--directory".into(),
+                    "--title=选择音乐文件夹".into(),
+                    format!("--filename={}/", start),
+                ],
+            ),
+            (
+                "kdialog",
+                vec![
+                    "--getexistingdirectory".into(),
+                    start.clone(),
+                    "--title".into(),
+                    "选择音乐文件夹".into(),
+                ],
+            ),
+            (
+                "yad",
+                vec![
+                    "--file".into(),
+                    "--directory".into(),
+                    "--title=选择音乐文件夹".into(),
+                ],
+            ),
+            (
+                "qarma",
+                vec![
+                    "--file-selection".into(),
+                    "--directory".into(),
+                    "--title=选择音乐文件夹".into(),
+                ],
+            ),
+        ];
+
+        let mut tried: Vec<String> = Vec::new();
+        // 说明：zenity 的参数解析依赖当前 locale。若 locale 不是 UTF-8（如 LANG=C），
+        // 中文标题会被判为非法选项并直接退出——这正是"选择器打不开"的隐蔽原因。
+        // 因此非 UTF-8 环境下强制给子进程 C.UTF-8（几乎全部发行版内置）。
+        let force_utf8 = !locale_is_utf8();
+        for (prog, args) in candidates {
+            let mut cmd = Command::new(prog);
+            cmd.args(&args);
+            if force_utf8 {
+                cmd.env("LC_ALL", "C.UTF-8");
+            }
+            match cmd.output() {
+                Ok(out) => {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        return Ok(if s.is_empty() { None } else { Some(PathBuf::from(s)) });
+                    }
+                    // zenity / kdialog 约定：退出码 1 = 用户点了取消
+                    if out.status.code() == Some(1) {
+                        return Ok(None);
+                    }
+                    tried.push(format!(
+                        "{}: {}",
+                        prog,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tried.push(format!("{}: 未安装", prog));
+                }
+                Err(e) => tried.push(format!("{}: {}", prog, e)),
+            }
+        }
+
+        if !tried.is_empty() {
+            eprintln!("[pick_folder] 原生选择器均不可用: {}", tried.join(" | "));
+        }
+        Err(
+            "系统未提供文件选择器（zenity/kdialog），已改用内置浏览器；\
+             安装 zenity 后可用系统原生对话框。"
+                .to_string(),
+        )
+    }
+}
+
+/// 当前 locale 是否为 UTF-8（按 LC_ALL > LC_CTYPE > LANG 的优先级取第一个非空值）
+fn locale_is_utf8() -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.trim().is_empty())
+        .map(|v| {
+            let u = v.to_ascii_uppercase();
+            u.contains("UTF-8") || u.contains("UTF8")
+        })
+        .unwrap_or(false)
+}
+
+/// 把输入框里键入/粘贴的内容整理成可用路径：
+/// - 去掉首尾空白
+/// - 去掉成对包裹的引号（文件管理器「复制路径」常见）
+/// - 识别并解码 `file://` URI（从浏览器/文件管理器拖来的形式）
+/// - 展开开头的 `~`
+fn normalize_input_path(s: &str) -> PathBuf {
+    let mut t = s.trim().to_string();
+
+    if t.len() >= 2 {
+        let b = t.as_bytes();
+        let q = b[0];
+        if (q == b'"' || q == b'\'') && b[b.len() - 1] == q {
+            t = t[1..t.len() - 1].trim().to_string();
+        }
+    }
+
+    if let Some(rest) = t.strip_prefix("file://") {
+        t = percent_decode(rest);
+    }
+
+    if t == "~" {
+        if let Some(h) = dirs::home_dir() {
+            return h;
+        }
+    } else if let Some(rest) = t.strip_prefix("~/") {
+        if let Some(h) = dirs::home_dir() {
+            return h.join(rest);
+        }
+    }
+
+    PathBuf::from(t)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
 
     #[allow(unused_mut)]
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Rust Music")
+        .with_title("hwplayer")
         .with_inner_size([1120.0, 720.0])
         .with_min_inner_size([900.0, 560.0]);
     // 只有非 Windows 才需要主窗口透明：那边桌面歌词还是 egui 子 viewport，
@@ -33,7 +33,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Rust Music",
+        "hwplayer",
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
@@ -46,22 +46,27 @@ fn main() -> eframe::Result<()> {
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    let candidates: &[&str] = if cfg!(windows) {
-        &[
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/msyhbd.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-            "C:/Windows/Fonts/simsun.ttc",
-            "C:/Windows/Fonts/Deng.ttf",
+    let candidates: Vec<String> = if cfg!(windows) {
+        vec![
+            "C:/Windows/Fonts/msyh.ttc".to_string(),
+            "C:/Windows/Fonts/msyhbd.ttc".to_string(),
+            "C:/Windows/Fonts/simhei.ttf".to_string(),
+            "C:/Windows/Fonts/simsun.ttc".to_string(),
+            "C:/Windows/Fonts/Deng.ttf".to_string(),
         ]
     } else {
-        &[
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        ]
+        let mut v: Vec<String> = Vec::new();
+        if let Ok(appdir) = std::env::var("APPDIR") {
+            v.push(format!("{}/usr/share/fonts/wqy-zenhei.ttc", appdir));
+        }
+        v.extend([
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".to_string(),
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf".to_string(),
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc".to_string(),
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc".to_string(),
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc".to_string(),
+        ]);
+        v
     };
 
     for path in candidates {

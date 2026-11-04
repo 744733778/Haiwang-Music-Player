@@ -132,11 +132,21 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 配置目录。程序更名为 hwplayer 后默认写 ~/.config/hwplayer；
+    /// 若新目录还没有配置、而旧版（rust-music）的配置存在，则继续沿用旧文件，
+    /// 避免改名导致用户丢失已导入的音乐文件夹、音量等设置。
+    fn dir() -> PathBuf {
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let new_dir = base.join("hwplayer");
+        let old_file = base.join("rust-music").join("config.json");
+        if !new_dir.join("config.json").exists() && old_file.exists() {
+            return base.join("rust-music");
+        }
+        new_dir
+    }
+
     pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rust-music")
-            .join("config.json")
+        Self::dir().join("config.json")
     }
 
     pub fn load() -> Self {

@@ -7,23 +7,39 @@
 ## 零、用 deb 安装（推荐，离线环境首选）
 
 本 deb 为**离线自包含版**：libmpv+ffmpeg 全链、X11/音频/字体等运行时库已内置到
-`/opt/haiwang-music`，**无需联网、无需预装 libmpv**。
+`/opt/hwplayer`，**无需联网、无需预装 libmpv**。
 
 ```bash
-# 离线直接安装（Depends 仅 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i haiwang-music_0.1.0-2_amd64.deb
+# 从旧版（haiwang-music）升级：两个包互斥，必须先卸旧包
+sudo dpkg -r haiwang-music 2>/dev/null || true
 
-# 运行：应用菜单里选「海王音乐播放器」，或命令行
-rust-music
+# 离线直接安装（Depends 仅 glibc/libgcc/显卡驱动栈，桌面机均已具备）
+sudo dpkg -i hwplayer_0.1.0-4_amd64.deb
+
+# 运行：应用菜单里选「hwplayer」，或命令行
+hwplayer
 
 # 卸载 / 彻底清除
-sudo dpkg -r haiwang-music
-sudo dpkg -P haiwang-music
+sudo dpkg -r hwplayer
+sudo dpkg -P hwplayer
 ```
 
-- 安装内容：`/opt/haiwang-music/`（程序 + 私有库 + 字体）、`/usr/bin/rust-music`(启动器)、desktop、图标、文档；**不向 `/usr/lib`、`/lib`、`/etc/ld.so*` 写入任何文件**，不做 ldconfig/服务操作。
+> 程序已更名为 **hwplayer**（命令、菜单项、窗口标题）。配置文件会自动沿用旧版
+> `~/.config/rust-music/config.json`，已导入的音乐文件夹和音量不会丢。
+
+- 安装内容：`/opt/hwplayer/`（程序 + 私有库 + 字体）、`/usr/bin/hwplayer`(启动器)、desktop、图标、文档；**不向 `/usr/lib`、`/lib`、`/etc/ld.so*` 写入任何文件**，不做 ldconfig/服务操作。
 - 若 `dpkg -i` 提示缺 `libgl1/libegl1/libdrm2/libgbm1`：说明该机是精简系统、未装显卡 GL 栈。这类机器本来也无法渲染界面；请先装好显卡驱动（风华/Mesa），或改用 AppImage。
-- 若系统缺 libmpv **不影响**本 deb —— libmpv 已随包内置（`/opt/haiwang-music/lib`）。
+- 若系统缺 libmpv **不影响**本 deb —— libmpv 已随包内置（`/opt/hwplayer/lib`）。
+
+### 选择音乐文件夹
+
+点顶部「浏览…」即可，不必手敲路径：
+
+- **有 `zenity` 时**：直接弹出系统文件选择器（GTK 原生对话框）。推荐装上以获得最佳体验：
+  `sudo apt install zenity`（deb 里只是 `Recommends`，不装也能正常用）
+- **没有 `zenity`/`kdialog` 时**：自动弹出内置目录浏览器（可「⬆ 上级」浏览、点「选择此文件夹」确认）。
+- 也可以直接在输入框粘贴路径后按 **回车**；支持 `~/音乐`、带引号的路径、`file://` URI。
+- 还可以把文件夹**直接拖进窗口**导入。
 
 ---
 
@@ -31,13 +47,13 @@ sudo dpkg -P haiwang-music
 
 ```bash
 # 进入产物目录
-cd /path/to/rust-music-x86_64.AppImage
+cd /path/to/hwplayer-x86_64.AppImage
 
 # 1. 给执行权限
-chmod +x rust-music-x86_64.AppImage
+chmod +x hwplayer-x86_64.AppImage
 
 # 2. 直接运行（推荐，需 FUSE）
-./rust-music-x86_64.AppImage
+./hwplayer-x86_64.AppImage
 ```
 
 首次运行会把它自身挂载到临时目录（`$APPDIR`），自动设置 `LD_LIBRARY_PATH` 与字体兜底路径。
@@ -57,7 +73,7 @@ AppImage 依赖 FUSE 把自身挂载为只读文件系统。
      ```
   2. 用**抽取模式**运行（无需 FUSE）：
      ```bash
-     ./rust-music-x86_64.AppImage --appimage-extract
+     ./hwplayer-x86_64.AppImage --appimage-extract
      # 生成 squashfs-root/，直接执行:
      ./squashfs-root/AppRun
      ```

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use libloading::Library;
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 pub type MpvHandle = *mut c_void;
 
@@ -110,33 +111,63 @@ impl MpvApi {
 pub struct Mpv {
     api: Arc<MpvApi>,
     ctx: MpvHandle,
+    /// 播放结束事件（来自后台事件泵）。只有播放实例才有；
+    /// 一次性转码/响度分析的实例走 `wait_end_file`，不能同抢事件队列。
+    end_rx: Option<Mutex<Receiver<()>>>,
+}
+
+/// mpv 的 ctx 是不透明的裸指针，事件泵线程要用，单独包一层声明 Send
+struct CtxPtr(MpvHandle);
+unsafe impl Send for CtxPtr {}
+
+impl CtxPtr {
+    fn raw(&self) -> MpvHandle {
+        self.0
+    }
 }
 
 unsafe impl Send for Mpv {}
 unsafe impl Sync for Mpv {}
 
 impl Mpv {
+    /// 播放器实例：启用「播放结束」事件监听
     pub fn new(volume: f64) -> Result<Self> {
-        Self::with_options(volume, &[])
+        Self::build(volume, &[], true)
     }
 
-    /// 带额外选项创建实例（等响度分析用：`o=<临时 wav>` 等）
+    /// 带额外选项创建实例（等响度分析用：`o=<临时 wav>` 等）。
+    /// 不启用事件泵 —— 这类实例自己用 `wait_end_file` 阻塞取事件。
     pub fn with_options(volume: f64, extra: &[(&str, &str)]) -> Result<Self> {
+        Self::build(volume, extra, false)
+    }
+
+    fn build(volume: f64, extra: &[(&str, &str)], with_events: bool) -> Result<Self> {
         let api = Arc::new(MpvApi::load()?);
         let ctx = unsafe { (api.create)() };
         if ctx.is_null() {
             return Err(anyhow!("mpv_create 返回空"));
         }
-        let m = Self { api, ctx };
+        let mut m = Self {
+            api,
+            ctx,
+            end_rx: None,
+        };
 
         m.set_option("config", "no");
         for (k, v) in extra {
             m.set_option(k, v);
         }
         m.set_option("vo", "null");
+        // 仅用于无声环境的自动测试：HWPLAYER_AO_NULL=1 时用 mpv 内置 null ao
+        // （它按实时推进时钟），避免容器里没有声卡导致瞬间“播完”。
+        if std::env::var_os("HWPLAYER_AO_NULL").is_some() {
+            m.set_option("ao", "null");
+        }
         m.set_option("audio-display", "no");
         m.set_option("idle", "yes");
-        m.set_option("keep-open", "no");
+        // 必须 keep-open=yes：否则文件播完会被卸载、核心进入 idle，
+        // 属性 eof-reached 随文件一起失效，靠轮询永远看不到“播完了”。
+        m.set_option("keep-open", "yes");
         m.set_option("terminal", "no");
         m.set_option("osc", "no");
         m.set_option("input-default-bindings", "no");
@@ -146,7 +177,29 @@ impl Mpv {
             return Err(anyhow!("mpv_initialize 失败：{}", m.err_string(rc)));
         }
         m.set_volume(volume);
+
+        if with_events {
+            let (tx, rx) = mpsc::channel::<()>();
+            m.end_rx = Some(Mutex::new(rx));
+            spawn_event_pump(Arc::clone(&m.api), CtxPtr(ctx), tx);
+        }
         Ok(m)
+    }
+
+    /// 取「上一曲播放结束」事件；一次排空，返回是否至少发生过一次。
+    /// 只认 EOF / ERROR，忽略 loadfile(replace) 产生的 STOP，避免切歌把自己再切一次。
+    pub fn take_end_file(&self) -> bool {
+        let Some(rx) = &self.end_rx else { return false };
+        let Ok(guard) = rx.lock() else { return false };
+        let mut got = false;
+        loop {
+            match guard.try_recv() {
+                Ok(()) => got = true,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        got
     }
 
     fn err_string(&self, rc: c_int) -> String {
@@ -222,9 +275,20 @@ impl Mpv {
         v != 0
     }
 
+    #[allow(dead_code)]
     pub fn eof_reached(&self) -> bool {
+        self.get_flag("eof-reached")
+    }
+
+    /// 核心是否处于 idle（没有已加载的文件）。
+    #[allow(dead_code)]
+    pub fn idle_active(&self) -> bool {
+        self.get_flag("idle-active")
+    }
+
+    fn get_flag(&self, name: &str) -> bool {
         let mut v: c_int = 0;
-        if let Some(k) = Self::cname("eof-reached") {
+        if let Some(k) = Self::cname(name) {
             unsafe {
                 (self.api.get_property)(
                     self.ctx,
@@ -397,4 +461,51 @@ impl Drop for Mpv {
             (self.api.terminate_destroy)(self.ctx);
         }
     }
+}
+
+/// 「播放结束」事件泵。
+///
+/// 为什么不能靠轮询 `eof-reached`：mpv 播完会把文件卸载/或与 loadfile 的异步过程
+/// 交错，属性时而读不到、时而是上一曲的残留值，UI 侧要么永远等不到、要么连环跳歌。
+/// 事件是每次播放结束恰好一次，语义干净。
+fn spawn_event_pump(api: Arc<MpvApi>, ctx: CtxPtr, tx: mpsc::Sender<()>) {
+    std::thread::spawn(move || {
+        const EV_NONE: c_int = 0;
+        const EV_SHUTDOWN: c_int = 1;
+        const EV_END_FILE: c_int = 7;
+        const REASON_EOF: c_int = 0;
+        const REASON_ERROR: c_int = 4;
+        loop {
+            let ev = unsafe { (api.wait_event)(ctx.raw(), 0.2) };
+            if ev.is_null() {
+                continue;
+            }
+            unsafe {
+                let dbg = std::env::var_os("HWPLAYER_DEBUG").is_some();
+                match (*ev).event_id {
+                    EV_NONE => {}
+                    EV_SHUTDOWN => break,
+                    EV_END_FILE => {
+                        // mpv_event_end_file.reason 是结构体第一个字段
+                        let reason = if (*ev).data.is_null() {
+                            -1
+                        } else {
+                            *((*ev).data as *const c_int)
+                        };
+                        // 只认 EOF(0) 与 ERROR(4)；STOP(2)/QUIT(3)/REDIRECT(5) 忽略，
+                        // 否则 loadfile(replace) 自身产生的 STOP 会造成连锁切歌。
+                        if dbg {
+                            eprintln!("[pump] END_FILE reason={}", reason);
+                        }
+                        if reason == REASON_EOF || reason == REASON_ERROR {
+                            if tx.send(()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
 }

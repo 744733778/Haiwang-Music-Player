@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 const BASE: &str = "https://api.amll.dev";
-const UA: &str = "rust-music/0.1 (+https://github.com/744733778)";
+const UA: &str = "hwplayer/0.1 (+https://github.com/744733778)";
 
 pub struct Amll;
 

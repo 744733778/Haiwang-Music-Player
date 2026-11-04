@@ -6,6 +6,8 @@
 
 <p align="center">libmpv + egui 写的桌面音乐播放器 · 纯本地 · Windows 解压即用 · 也可跑在银河麒麟 / Linux</p>
 
+<p align="center"><b>当前版本 0.1.0-4</b> —— 修复「一首播完不会自动播下一首」</p>
+
 ---
 
 从 [BYD-AplayerFoliaMix](https://github.com/744733778/BYD-AplayerFoliaMix) 提炼的最小桌面原型。只保留最必要的能力，重点做好**歌词**：多源在线匹配、取匹配度最高的歌词，保存到音频同目录。
@@ -14,12 +16,30 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| Windows 7 / 10 / 11 (64 位) | [Releases](../../releases) 里的 `haiwang-music-player-win64-v4.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
-| 银河麒麟 V10 SP1 (x86_64) | `haiwang-music_0.1.0-2_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
-| 银河麒麟 / 其它 Linux | `rust-music-x86_64.appimage` | 免安装单文件，跑前 `chmod +x` |
+| Windows 7 / 10 / 11 (64 位) | `haiwang-music-player-win64-0.1.0-4.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
+| 银河麒麟 V10 SP1 (x86_64) | `hwplayer_0.1.0-4_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
+| 银河麒麟 / 其它 Linux | `hwplayer-x86_64.AppImage` | 免安装单文件，跑前 `chmod +x` |
+
+都在 [Releases](../../releases) 里。
 
 - **项目图标**：`icon.png`
 - **麒麟 / Linux 版说明**：构建方式、依赖取舍、排障见 [`kylin/README.md`](kylin/README.md) 与 [`kylin/run-on-kylin.md`](kylin/run-on-kylin.md)
+
+### 0.1.0-4 修了什么
+
+**一首播完不会自动播下一首** —— 两个平台同源，Windows 和 Linux 都中招。
+
+根因在 `src/mpv.rs`：mpv 配的是 `keep-open=no`，文件播完 mpv 会卸载文件、核心进入 idle，`eof-reached` 属性随文件一起失效，`poll_mpv()` 轮询到的永远是 `false` —— 界面根本不知道「播完了」，自然不会调 `next()`。
+
+修复：
+
+- `keep-open=yes`，播完保留文件并自动暂停
+- 结束判据换成**进度到结尾 + mpv 已自动暂停**（`dur > 0.5 && pos >= dur - 0.2 && paused`），同时兼容 `END_FILE` 事件（部分 libmpv 版本会发）
+- 加「每曲只触发一次」标志 + 600ms 切歌保护窗，避免 `loadfile` 异步切换时把上一曲的收尾状态误判成新曲播完，造成连锁跳歌
+- 事件泵只给播放实例启用；响度分析用的 `wait_end_file` 实例不启用，避免两个线程抢同一个事件队列
+
+顺带：文件夹输入框支持回车导入、自动去掉粘贴时带的引号、解码 `file://` 路径，也支持把文件夹直接拖进窗口。
+
 
 ## 已实现
 
@@ -85,9 +105,11 @@ egui 的 `show_viewport_immediate + with_transparent(true)` 在 Windows 上**不
 
 | 形态 | 大小 | 依赖策略 |
 | --- | --- | --- |
-| `.deb` 离线包 | ~81 MB | libmpv + 完整 ffmpeg 链、X11/xcb/wayland、字体栈、alsa/jack 共 280 个库私有化到 `/opt/haiwang-music/lib`；**不写 `/usr/lib`、`/lib`、`/etc/ld.so*`**，不碰系统包 |
+| `.deb` 离线包 | ~81 MB | libmpv + 完整 ffmpeg 链、X11/xcb/wayland、字体栈、alsa/jack 共 282 个库私有化到 `/opt/hwplayer/lib`；**不写 `/usr/lib`、`/lib`、`/etc/ld.so*`**，不碰系统包 |
 | `.AppImage` | ~90 MB | 内置 libmpv + ffmpeg + 文泉驿中文字体；GUI/显卡栈交给目标系统 |
-| 原始 ELF | ~15 MB | 需系统自带 `libmpv.so.2` |
+| 原始 ELF | ~8 MB | 需系统自带 `libmpv.so.2`，排障用 |
+
+装了 deb 之后命令是 `hwplayer`（`/usr/bin/hwplayer` → `/opt/hwplayer/bin/hwplayer`），卸载 `sudo dpkg -P hwplayer`。
 
 两者都**不打包 glibc**（兼容性前提）、**不打包 `libGL/libEGL/libGLX/libdrm`**（必须由显卡驱动提供，打包反而破坏加速）。主程序最高只需 `GLIBC_2.30`。
 

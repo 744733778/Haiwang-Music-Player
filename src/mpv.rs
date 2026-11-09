@@ -165,9 +165,14 @@ impl Mpv {
         }
         m.set_option("audio-display", "no");
         m.set_option("idle", "yes");
-        // 必须 keep-open=yes：否则文件播完会被卸载、核心进入 idle，
-        // 属性 eof-reached 随文件一起失效，靠轮询永远看不到“播完了”。
-        m.set_option("keep-open", "yes");
+        // 关键：keep-open 必须是 no。
+        // keep-open=yes 时 mpv 会把文件挂在末尾并暂停，END_FILE 事件永远不会发出
+        // （所有 libmpv 版本皆然），只能靠 pause / time-pos / duration 三个属性去猜
+        // “播完了”：实机只要 pause=0、或 EOF 时 time-pos 与 duration 相差超过 0.2s，
+        // 就永远卡在最后一首，不会续播。
+        // 设为 no 后，EOF 会稳定且仅一次地发出 MPV_EVENT_END_FILE(reason=EOF)，
+        // 这是跨 libmpv 版本、跨音频后端、跨音频格式唯一可靠的结束信号。
+        m.set_option("keep-open", "no");
         m.set_option("terminal", "no");
         m.set_option("osc", "no");
         m.set_option("input-default-bindings", "no");
@@ -275,7 +280,6 @@ impl Mpv {
         v != 0
     }
 
-    #[allow(dead_code)]
     pub fn eof_reached(&self) -> bool {
         self.get_flag("eof-reached")
     }
@@ -465,9 +469,10 @@ impl Drop for Mpv {
 
 /// 「播放结束」事件泵。
 ///
-/// 为什么不能靠轮询 `eof-reached`：mpv 播完会把文件卸载/或与 loadfile 的异步过程
-/// 交错，属性时而读不到、时而是上一曲的残留值，UI 侧要么永远等不到、要么连环跳歌。
-/// 事件是每次播放结束恰好一次，语义干净。
+/// `keep-open=no` 时，mpv 在每首歌真正播完的瞬间卸载文件并发出
+/// `MPV_EVENT_END_FILE(reason=EOF)`，一次且仅一次，与 libmpv 版本、音频后端、
+/// 文件格式都无关。主动 `loadfile replace` 切歌产生的是 `reason=STOP`，下面会过滤，
+/// 不会造成连锁跳歌。属性轮询（eof-reached / 进度）只作为事件万一丢失时的兜底。
 fn spawn_event_pump(api: Arc<MpvApi>, ctx: CtxPtr, tx: mpsc::Sender<()>) {
     std::thread::spawn(move || {
         const EV_NONE: c_int = 0;

@@ -6,7 +6,7 @@
 
 <p align="center">libmpv + egui 写的桌面音乐播放器 · 纯本地 · Windows 解压即用 · 也可跑在银河麒麟 / Linux</p>
 
-<p align="center"><b>当前版本 0.1.0-4</b> —— 修复「一首播完不会自动播下一首」</p>
+<p align="center"><b>当前版本 0.1.0-5</b> —— 真正修好「一首播完不会自动播下一首」</p>
 
 ---
 
@@ -16,29 +16,33 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| Windows 7 / 10 / 11 (64 位) | `haiwang-music-player-win64-0.1.0-4.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
-| 银河麒麟 V10 SP1 (x86_64) | `hwplayer_0.1.0-4_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
+| Windows 7 / 10 / 11 (64 位) | `haiwang-music-player-win64-0.1.0-5.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
+| 银河麒麟 V10 SP1 (x86_64) | `hwplayer_0.1.0-5_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
 | 银河麒麟 / 其它 Linux | `hwplayer-x86_64.AppImage` | 免安装单文件，跑前 `chmod +x` |
+| 排障 / 二次开发 | `hwplayer-linux-x86_64.elf`、`hwplayer-0.1.0-5.patch`、`SHA256SUMS` | 原始 ELF、完整补丁、校验值 |
 
 都在 [Releases](../../releases) 里。
 
 - **项目图标**：`icon.png`
 - **麒麟 / Linux 版说明**：构建方式、依赖取舍、排障见 [`kylin/README.md`](kylin/README.md) 与 [`kylin/run-on-kylin.md`](kylin/run-on-kylin.md)
 
-### 0.1.0-4 修了什么
+### 0.1.0-5 修了什么
 
-**一首播完不会自动播下一首** —— 两个平台同源，Windows 和 Linux 都中招。
+**一首播完不会自动播下一首** —— 0.1.0-4 的修复在银河麒麟实机上仍然失效，这一版才是真正的修复。两个平台同一份源码，Windows 与 Linux 一起更新。
 
-根因在 `src/mpv.rs`：mpv 配的是 `keep-open=no`，文件播完 mpv 会卸载文件、核心进入 idle，`eof-reached` 属性随文件一起失效，`poll_mpv()` 轮询到的永远是 `false` —— 界面根本不知道「播完了」，自然不会调 `next()`。
+0.1.0-4 把 mpv 改成了 `keep-open=yes`，靠「进度 ≥ 时长 − 0.2 秒 且 `pause=1`」判定播完。问题在于：`keep-open=yes` 会让 mpv 把文件挂在末尾并暂停，**`MPV_EVENT_END_FILE` 因此永远不会发出**（mpv 的设计，所有版本皆然）；而真实声卡有缓冲、不同格式末帧位置不同、`pause` 也可能保持 0，三个条件任一不成立就永远卡在最后一首。构建容器里三个条件恰好擦边满足，所以被误判为已修复。
 
-修复：
+0.1.0-5 的做法：
 
-- `keep-open=yes`，播完保留文件并自动暂停
-- 结束判据换成**进度到结尾 + mpv 已自动暂停**（`dur > 0.5 && pos >= dur - 0.2 && paused`），同时兼容 `END_FILE` 事件（部分 libmpv 版本会发）
-- 加「每曲只触发一次」标志 + 600ms 切歌保护窗，避免 `loadfile` 异步切换时把上一曲的收尾状态误判成新曲播完，造成连锁跳歌
-- 事件泵只给播放实例启用；响度分析用的 `wait_end_file` 实例不启用，避免两个线程抢同一个事件队列
+- 改回 **`keep-open=no`**：EOF 时 mpv 卸载文件并发出且仅发出一次 `END_FILE(reason=EOF)`，与 libmpv 版本、音频后端、音频格式全部解耦
+- `poll_mpv()` 以该事件为主判据；`eof-reached` 属性与放宽到 1 秒容差的进度判据只作兜底
+- 事件泵只认 `EOF(0)` / `ERROR(4)`，忽略主动 `loadfile replace` 产生的 `STOP(2)`，避免连锁跳歌
+- 切歌前排空滞留事件；500ms 保护窗内到达的信号**直接丢弃而不缓存**；本曲至少播放 700ms 才允许续播 —— 坏文件 / 无声卡造成的「瞬间 EOF」不会把整个列表跳光
+- `HWPLAYER_DEBUG=1` 会打印 `[pump] END_FILE reason=` 与 `[advance] from=N`，便于实机抓日志排障
 
-顺带：文件夹输入框支持回车导入、自动去掉粘贴时带的引号、解码 `file://` 路径，也支持把文件夹直接拖进窗口。
+> **别下旧包**：v4 与 0.1.0-4 两个发布页都已加横幅指向本版，旧包仍带这个 bug。
+
+顺带（0.1.0-4 已有）：文件夹输入框支持回车导入、自动去掉粘贴时带的引号、解码 `file://` 路径，也支持把文件夹直接拖进窗口；Linux 侧程序更名为 `hwplayer`，并沿用旧 `~/.config/rust-music` 配置。
 
 
 ## 已实现
@@ -105,8 +109,8 @@ egui 的 `show_viewport_immediate + with_transparent(true)` 在 Windows 上**不
 
 | 形态 | 大小 | 依赖策略 |
 | --- | --- | --- |
-| `.deb` 离线包 | ~81 MB | libmpv + 完整 ffmpeg 链、X11/xcb/wayland、字体栈、alsa/jack 共 282 个库私有化到 `/opt/hwplayer/lib`；**不写 `/usr/lib`、`/lib`、`/etc/ld.so*`**，不碰系统包 |
-| `.AppImage` | ~90 MB | 内置 libmpv + ffmpeg + 文泉驿中文字体；GUI/显卡栈交给目标系统 |
+| `.deb` 离线包 | ~77 MB | libmpv + 完整 ffmpeg 链、X11/xcb/wayland、字体栈、alsa/jack 共 282 个库私有化到 `/opt/hwplayer/lib`；**不写 `/usr/lib`、`/lib`、`/etc/ld.so*`**，不碰系统包 |
+| `.AppImage` | ~89 MB | 内置 libmpv + ffmpeg + 文泉驿中文字体；GUI/显卡栈交给目标系统 |
 | 原始 ELF | ~8 MB | 需系统自带 `libmpv.so.2`，排障用 |
 
 装了 deb 之后命令是 `hwplayer`（`/usr/bin/hwplayer` → `/opt/hwplayer/bin/hwplayer`），卸载 `sudo dpkg -P hwplayer`。

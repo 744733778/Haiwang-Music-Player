@@ -14,7 +14,7 @@
 sudo dpkg -r haiwang-music 2>/dev/null || true
 
 # 离线直接安装（Depends 仅 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i hwplayer_0.1.0-4_amd64.deb
+sudo dpkg -i hwplayer_0.1.0-5_amd64.deb
 
 # 运行：应用菜单里选「hwplayer」，或命令行
 hwplayer

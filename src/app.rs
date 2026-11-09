@@ -105,10 +105,12 @@ pub struct App {
 
     seeking: bool,
     seek_value: f64,
-    /// 刚切歌后短时间内忽略残余的结束事件，防止连锁跳歌
+    /// 刚切歌后短时间内忽略残余的结束状态，防止连锁跳歌
     eof_guard_until: Option<Instant>,
     /// 本曲的“播放结束”是否已处理过（每曲只切一次）
     ended_for_track: bool,
+    /// 本曲开始播放的时刻：太短就“播完”属于异常（坏文件/无声卡瞬间 EOF），不当作续播
+    track_started_at: Instant,
 
     show_settings: bool,
     /// 桌面歌词窗口位置只在首帧设置，之后交给系统拖动，避免每帧回写导致抖动/不跟手
@@ -159,6 +161,7 @@ impl App {
             seek_value: 0.0,
             eof_guard_until: None,
             ended_for_track: false,
+            track_started_at: Instant::now(),
             show_settings: false,
             original_order: None,
             #[cfg(not(windows))]
@@ -334,6 +337,8 @@ impl App {
         // 先定增益再 load，避免开头一瞬间音量跳一下
         self.apply_gain(&song);
         if let Some(m) = &self.mpv {
+            // 切歌前排空滞留的结束事件：上一曲的迟到 EOF 不能落到新曲上
+            let _ = m.take_end_file();
             m.load(&song.path.to_string_lossy(), true);
         }
         self.duration = if song.duration_ms > 0 {
@@ -344,8 +349,9 @@ impl App {
         self.position = 0.0;
         self.playing = true;
         self.ended_for_track = false;
-        // loadfile 是异步的：给 mpv 600ms 完成切换，期间不判定结束
-        self.eof_guard_until = Some(Instant::now() + Duration::from_millis(600));
+        self.track_started_at = Instant::now();
+        // loadfile 是异步的：给 mpv 500ms 完成切换，期间收到的结束信号一律丢弃
+        self.eof_guard_until = Some(Instant::now() + Duration::from_millis(500));
         self.last_scrolled = None;
         self.load_lyrics_for(&song);
         self.status = format!("正在播放：{}", song.display());
@@ -547,11 +553,14 @@ impl App {
     }
 
     fn poll_mpv(&mut self) {
-        let (pos, dur, paused, ev_ended) = match &self.mpv {
+        let (pos, dur, paused, eof_reached, ev_ended) = match &self.mpv {
             Some(m) => (
                 m.time_pos(),
                 m.duration(),
                 m.paused(),
+                m.eof_reached(),
+                // 每帧排空事件队列：END_FILE(EOF/ERROR) 是「播完了」的主判据，
+                // keep-open=no 下每首恰好发一次，与 libmpv 版本/音频后端/格式无关。
                 m.take_end_file(),
             ),
             None => return,
@@ -569,30 +578,40 @@ impl App {
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n % 40 == 0 {
                 eprintln!(
-                    "[poll] pos={:.2} dur={:.2} paused={} ev_ended={}",
-                    pos, dur, paused, ev_ended
+                    "[poll] pos={:.2} dur={:.2} paused={} eof={} ev_ended={}",
+                    pos, dur, paused, eof_reached, ev_ended
                 );
             }
         }
 
-        // 播放结束的两个判据：
-        //  a) END_FILE 事件（某些版本的 libmpv 会发）
-        //  b) 进度到结尾 + mpv 自动暂停——keep-open=yes 的标准表现。
-        //     focal 的 libmpv 0.32 实测只走 b)，不会发 END_FILE。
-        let reached_end = dur > 0.5 && pos >= dur - 0.2 && paused;
-        if !(ev_ended || reached_end) {
-            return;
-        }
-        if self.current.is_none() || self.ended_for_track {
-            return;
-        }
-        // 刚切歌的 600ms 内不判定，避免把上一曲的收尾状态当成新曲播完
+        // 切歌保护窗：loadfile 是异步的，窗口内取到的结束信号一律丢弃。
+        // 不缓存——若缓存，坏文件 / 无声卡等「几十毫秒就 EOF」的异常会每
+        // 500ms 跳一首，把整个列表连锁跳光。正常曲目（秒级以上）播完时窗口早已结束。
         if let Some(until) = self.eof_guard_until {
             if Instant::now() < until {
                 return;
             }
+            self.eof_guard_until = None;
         }
-        self.eof_guard_until = None;
+        if self.current.is_none() || self.ended_for_track {
+            return;
+        }
+        // 本曲必须真的播放过一段时间：文件损坏、格式不支持或音频设备异常时
+        // mpv 会瞬间发出 EOF，那不算「播完了一首」，不应续播。
+        if self.track_started_at.elapsed() < Duration::from_millis(700) {
+            return;
+        }
+
+        // 结束信号：事件为主，属性为辅；三者 EOF 后都不会持续为真，
+        // 配合 ended_for_track 保证每曲只切一次。
+        //  a) END_FILE 事件（keep-open=no 下必发）
+        //  b) eof-reached 属性
+        //  c) 进度接近结尾且已暂停 —— 宽松兜底，容差从 0.2s 放宽到 1s，
+        //    且不再把 pause 当成所有路径的硬条件
+        let progress_end = dur > 0.5 && pos > 0.0 && pos >= dur - 1.0 && paused;
+        if !(ev_ended || eof_reached || progress_end) {
+            return;
+        }
         self.ended_for_track = true;
         if std::env::var_os("HWPLAYER_DEBUG").is_some() {
             if let Some(i) = self.current {

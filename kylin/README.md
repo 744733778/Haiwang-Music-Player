@@ -14,14 +14,14 @@
 | 文件 | 说明 |
 |------|------|
 | `artifacts/hwplayer-x86_64.AppImage` | **主交付物**：可直接在银河麒麟上运行的 AppImage（约 87MB，已内置 libmpv/ffmpeg、GTK/XCB 依赖、中文字体）|
-| `artifacts/hwplayer_0.1.0-4_amd64.deb` | **deb 离线自包含安装包**（约 78MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
+| `artifacts/hwplayer_0.1.0-5_amd64.deb` | **deb 离线自包含安装包**（约 78MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
 | `artifacts/hwplayer` | 编译出的原始 ELF（未打包 glibc，最高 GLIBC 需求 2.30 ≤ 2.31）|
 | `artifacts/glibc_check.txt` | GLIBC 版本需求校验结论（兼容麒麟）|
 | `assets/linuxdeploy-x86_64.AppImage` | 离线打包工具（linuxdeploy）|
 | `assets/runtime-x86_64` | 离线 type2 runtime（appimagetool 打包用，免联网下载）|
 | `assets/icon.png` / `icon_256.png` | 程序图标（256x256 为 AppImage 规范所需尺寸）|
 
-> **版本说明**：`0.1.0-4` 修复了「**一首播完不会自动播下一首**」，并把程序整体更名为 **hwplayer**（命令、包名、desktop、窗口标题）；同时修掉了 AppImage 打包链路里三个会让它在真实桌面起不来的问题。详见下方[更新记录](#更新记录)。
+> **版本说明**：`0.1.0-5` 重新修复了「**一首播完不会自动播下一首**」——`0.1.0-4` 的做法在实机上仍会失效，本次改用 mpv 原生的 `END_FILE` 事件判定播完，不再依赖进度/暂停属性。程序名仍为 **hwplayer**。详见下方[更新记录](#更新记录)。
 
 > **兼容性结论**：主程序最高仅需求 `GLIBC_2.30`，低于麒麟 V10 SP1 的 `glibc 2.31`；AppImage **未打包 glibc**（运行时使用系统 glibc），符合发行版兼容目标。
 
@@ -52,10 +52,10 @@ chmod +x hwplayer-x86_64.AppImage
 
 ```bash
 # 离线机直接安装（Depends 仅需 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i hwplayer_0.1.0-4_amd64.deb
+sudo dpkg -i hwplayer_0.1.0-5_amd64.deb
 
 # 也可用 apt（本地文件）
-sudo apt install ./hwplayer_0.1.0-4_amd64.deb
+sudo apt install ./hwplayer_0.1.0-5_amd64.deb
 
 # 运行：应用菜单「海王音乐播放器」，或命令行
 hwplayer
@@ -101,7 +101,7 @@ haiwang/
 │   └── patch_eframe.py         # (备查) 曾尝试彻底移除 egui-wgpu 的方案，最终因 eframe 需 edition2024 未采用
 └── artifacts/                  # 构建产物与日志
     ├── hwplayer-x86_64.AppImage
-    ├── hwplayer_0.1.0-4_amd64.deb
+    ├── hwplayer_0.1.0-5_amd64.deb
     ├── hwplayer
     ├── glibc_check.txt
     └── *.log
@@ -111,17 +111,60 @@ haiwang/
 
 ## 更新记录
 
-### 0.1.0-4（当前）
+### 0.1.0-5（当前）
 
-**问题 1：一首播完不会自动播下一首（体验中断）**
+**修复：一首播完仍不会自动播下一首（实机复现，真正的根因）**
 
-- 根因：`src/mpv.rs` 里 mpv 配了 `keep-open=no`。文件播完时 mpv 会卸载文件、核心进入 idle，`eof-reached` 属性随文件一起失效，`poll_mpv()` 轮询到的永远是 false —— UI 根本不知道「播完了」，自然不会调用 `next()`。
-- 修复：
-  - 改为 `keep-open=yes`（播完保留文件并自动暂停）；
-  - 结束判据改为**进度到结尾 + mpv 已自动暂停**（`dur > 0.5 && pos >= dur - 0.2 && paused`），同时兼容 `END_FILE` 事件（部分 libmpv 版本会发）；
-  - 加「每曲只触发一次」标志 + 600ms 切歌保护窗，避免 loadfile 异步切换时把上一曲的收尾状态误判成新曲播完而连锁跳歌；
-  - 事件泵只给播放实例启用；响度分析用的 `wait_end_file` 实例不启用，避免两个线程抢同一个事件队列。
-- 验证：3 首 10 秒音频，34 秒内严格按 `01→02→03→01` 切歌，每首播满 10 秒（`[advance]` 日志逐条核对），无跳歌、无重复切。
+`0.1.0-4` 的修复在构建容器里测试通过，但在银河麒麟实机上仍不生效。用 ctypes 直接
+驱动 libmpv 0.32 做对照实测后定位到两层根因：
+
+| 场景 | EOF 时的真实状态 | 旧判据 `dur>0.5 && pos>=dur-0.2 && paused` |
+|---|---|---|
+| 构建容器 `ao=null` + wav | `pos 2.84 / dur 3.00 / pause=1` | 擦边通过（差 0.16s） |
+| mp3 / flac | 差 0.19s / 0.18s | 擦边通过 |
+| `keep-open-pause=no` | `pause=0`、`eof-reached=1` | **失效** |
+| 真实 ALSA 音频后端 | 属性表现完全不同 | **失效** |
+
+1. `keep-open=yes`（0.1.0-4 引入）会让 mpv 在 EOF 时把文件挂在末尾并暂停，
+   **`MPV_EVENT_END_FILE` 事件永远不发** —— 这是 mpv 的设计，所有版本皆然。
+   于是事件泵这条最可靠的路径被彻底屏蔽。
+2. 只剩「进度 ≥ 时长−0.2 秒 且 `pause=1`」这一个判据。它同时依赖 `duration`
+   可读、`time-pos` 贴着时长（容差仅 0.2 秒）、`pause` 属性为 true。真实声卡
+   有缓冲、不同格式末帧位置不同、`pause` 也可能保持 0，任一条件不成立就永远
+   卡在最后一首。容器测试恰好三个条件都擦边满足，所以被误判为「已修复」。
+
+修复（`src/mpv.rs` + `src/app.rs`）：
+
+- 改回 **`keep-open=no`**：EOF 时 mpv 卸载文件并发出且仅发出一次
+  `MPV_EVENT_END_FILE(reason=EOF)`。这是跨 libmpv 版本、跨音频后端、跨音频
+  格式都可靠的结束信号，与 `duration` / `time-pos` / `pause` 全部解耦。
+- `poll_mpv()` 以该事件为主判据；`eof-reached` 属性与放宽到 1 秒容差的进度
+  判据只作兜底。
+- 保留「每曲只切一次」标志与 500ms 切歌保护窗；**窗口内到达的事件直接丢弃
+  而不缓存**，并要求本曲至少播放 700ms —— 避免坏文件 / 无声卡等「瞬间 EOF」
+  把整个列表连锁跳光。
+- `HWPLAYER_DEBUG=1` 会打印 `eof` / `ev_ended` 及 `[pump] END_FILE reason=`、
+  `[advance]`，便于实机抓日志排障。
+
+验证（focal 容器，Xvfb + 真实程序，wav / mp3 / flac 各 3 秒）：
+
+- `ao=null` 实时时钟：13 秒内 4 次切歌，严格 `01→02→03→01`，每首播满 3 秒，
+  `END_FILE` 与 `[advance]` 一一对应。
+- ALSA 假设备（瞬间 EOF）：不再连锁跳歌。
+
+> 若实机仍有异常：`HWPLAYER_DEBUG=1 /usr/bin/hwplayer 2>~/hwplayer.log`，
+> 日志里 `[pump] END_FILE reason=0` 表示 mpv 已正常报告播完，
+> `[advance] from=N` 表示界面已切歌；把日志发回即可定位。
+
+### 0.1.0-4
+
+
+**问题 1：一首播完不会自动播下一首（初次修复，后被 0.1.0-5 取代）**
+
+- 初版判断：`keep-open=no` 时文件播完会被卸载、`eof-reached` 属性失效，UI 轮询不到「播完了」。
+- 初版做法：改为 `keep-open=yes`，用「进度到结尾 + mpv 自动暂停」判定，加每曲一次标志与 600ms 保护窗；容器里 3 首 10 秒音频实测通过。
+- **但这一版在实机上仍然失效**：`keep-open=yes` 会让 mpv 永远不发 `END_FILE` 事件，只剩「进度+暂停」判据，而真实声卡的缓冲 / `pause=0` 会让它永远不成立。真正的修复见 `0.1.0-5`。
+- 本版同时完成：程序更名为 hwplayer、AppImage 打包链路三处修复、离线自包含 deb、系统原生目录选择。
 
 **问题 2：程序更名为 hwplayer**
 
@@ -189,7 +232,7 @@ docker run --rm -v "$PWD/out:/out" ubuntu:20.04 bash -c '
   bash /scripts/collect_libs.sh /out/libset /out/wqy-zenhei.ttc'   # 需挂载 scripts/
 # 2) 用该库集装配离线 deb（宿主执行即可）
 LIB_SRC="$PWD/out/libset" FONT_SRC="$PWD/out/wqy-zenhei.ttc" bash scripts/build_deb.sh
-# 产物: artifacts/hwplayer_0.1.0-4_amd64.deb
+# 产物: artifacts/hwplayer_0.1.0-5_amd64.deb
 ```
 
 ---

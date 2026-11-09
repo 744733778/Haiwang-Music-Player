@@ -1,119 +1,81 @@
-hwplayer — 海王音乐播放器（银河麒麟适配版）0.1.0-4
+hwplayer — 海王音乐播放器（银河麒麟适配版）0.1.0-5
 ================================================================
 目标平台: 银河麒麟 V10 SP1 (x86_64, glibc 2.31, 风华显卡/OpenGL)
 上游项目: https://github.com/744733778/Haiwang-Music-Player
 构建环境: Ubuntu 20.04 (glibc 2.31) + Rust stable
 主程序最高 GLIBC 需求: 2.30  (<= 2.31，兼容)
+程序名称: hwplayer（命令 / 包名 / 菜单 / 窗口标题）
 
-
-本次更新（0.1.0-4）
+本次更新（0.1.0-5）：真正修复「一首播完不会自动播下一首」
 ----------------------------------------------------------------
-1. 修复「一首播完不会自动播下一首」
-   原因：mpv 配了 keep-open=no，播完会卸载文件并进入 idle，
-   eof-reached 属性随之失效，界面永远收不到“播完了”，也就不会切歌。
-   现在改为 keep-open=yes，并以“进度到结尾 + mpv 自动暂停”判定结束，
-   加每曲只触发一次 + 600ms 保护窗，按列表顺序循环播放。
-   实测：3 首 10 秒音频，34 秒内严格 01→02→03→01，每首播满，无跳歌。
+0.1.0-4 在构建容器里测试通过，但实机仍然不生效。用 ctypes 直接驱动
+libmpv 0.32 做对照实测，定位到两层根因：
 
-2. 程序更名为 hwplayer（命令 / 菜单 / 窗口标题 / 包名）
-   旧配置仍会被沿用，已导入的音乐文件夹和音量不会丢。
+1. 0.1.0-4 设了 keep-open=yes。mpv 在这个模式下会把文件挂在末尾并暂停，
+   MPV_EVENT_END_FILE 事件永远不发（mpv 的设计，所有版本皆然）——
+   事件泵这条最可靠的路径被彻底屏蔽。
+2. 于是只剩「进度 >= 时长-0.2 秒 且 pause=1」这一个判据。它同时依赖
+   duration 可读、time-pos 贴着时长（容差仅 0.2 秒）、pause 为 true。
+   真实声卡有缓冲、不同格式末帧位置不同、pause 也可能保持 0，
+   任一条件不成立就永远卡在最后一首。容器测试恰好三个条件都擦边
+   满足（wav 差 0.16s、mp3 差 0.19s、flac 差 0.18s），所以被误判为已修复。
 
-3. 修掉 AppImage 三个会导致真实桌面起不来的打包问题
-   （AppRun 软链覆盖二进制、AppRun 未设 LD_LIBRARY_PATH、
-    linuxdeploy 跳过 libasound/libjack/libusb）
+修复：
+  * 改回 keep-open=no：EOF 时 mpv 卸载文件并发出且仅发出一次
+    MPV_EVENT_END_FILE(reason=EOF)，跨 libmpv 版本 / 音频后端 / 音频格式
+    都可靠，与 duration、time-pos、pause 全部解耦。
+  * poll_mpv() 以该事件为主判据；eof-reached 属性与放宽到 1 秒容差的
+    进度判据仅作兜底。
+  * 保留每曲只切一次标志与 500ms 切歌保护窗；窗口内到达的事件直接丢弃
+    而不缓存，并要求本曲至少播放 700ms —— 避免坏文件 / 无声卡等「瞬间
+    EOF」把整个列表连锁跳光。
+  * HWPLAYER_DEBUG=1 会打印 eof / ev_ended 与 [pump] END_FILE reason=、
+    [advance]，便于实机抓日志排障。
 
+验证（focal 容器 Xvfb + 真实程序，wav/mp3/flac 各 3 秒）：
+  * 实时时钟：13 秒内 4 次切歌，严格 01→02→03→01，每首播满 3 秒，
+    4 次 END_FILE 与 4 次 advance 一一对应。
+  * ALSA 假设备（瞬间 EOF）：1 次 END_FILE、0 次切歌，不再连锁跳歌。
 
 包内文件
 ----------------------------------------------------------------
-  hwplayer_0.1.0-4_amd64.deb      离线 deb 安装包 (78MB)
-  hwplayer-x86_64.AppImage        自包含 AppImage (90MB)
+  hwplayer_0.1.0-5_amd64.deb      离线 deb 安装包 (约 78MB)
+  hwplayer-x86_64.AppImage        自包含 AppImage (约 90MB)
   hwplayer-linux-x86_64.elf       未打包的原始 ELF (备用/排障)
+  glibc_check.txt                 GLIBC 兼容校验结论
   SHA256SUMS                      校验和
   INSTALL.txt                     本文件
   README.md                       项目说明、构建方法与完整更新记录
   run-on-kylin.md                 麒麟运行与排障指南
-  hwplayer-0.1.0-4.patch          本次全部源码改动的 git diff
-  source/                         修改后的完整源码（可直接 cargo build）
+  hwplayer-0.1.0-5.patch          本次全部源码改动的 git diff
+  source/                         修改后的完整源码（含 Cargo.lock）
 
-
-先校验完整性
+安装（离线，无需联网）
 ----------------------------------------------------------------
-  sha256sum -c SHA256SUMS
+deb（推荐）：
+  sudo dpkg -i hwplayer_0.1.0-5_amd64.deb
+  菜单里会出现「hwplayer」，或命令行执行 /usr/bin/hwplayer
+  升级前请先卸旧包：sudo dpkg -r haiwang-music  (本包 Conflicts/Replaces)
+  卸载：sudo dpkg -r hwplayer ；彻底清除：sudo dpkg -P hwplayer
 
-如果压缩包是在 Windows 上解压、再拷贝到麒麟：
-  Windows 不保存 Linux 可执行权限，AppImage 会变成 644，先补一下：
-     chmod +x hwplayer-x86_64.AppImage hwplayer-linux-x86_64.elf
-  deb 不需要可执行权限。
-
-
-方式一：deb 安装（推荐，离线可用）
-----------------------------------------------------------------
-  # 若装过旧版（haiwang-music），两个包互斥，先卸掉
-  sudo dpkg -r haiwang-music
-
-  sudo dpkg -i hwplayer_0.1.0-4_amd64.deb
-
-  运行:  菜单里选「hwplayer」，或命令行 hwplayer
-  卸载:  sudo dpkg -r hwplayer
-  彻底清除: sudo dpkg -P hwplayer
-
-  安装位置:
-    /opt/hwplayer/bin/hwplayer       真身
-    /opt/hwplayer/lib/               私有运行时库（282 个，含 libmpv+ffmpeg）
-    /opt/hwplayer/usr/share/fonts/   文泉驿中文字体
-    /usr/bin/hwplayer                启动器（设库路径后 exec 真身）
-
-  离线可用：Depends 只需 libc6 / libgcc / 显卡驱动栈
-  （libgl1 libegl1 libdrm2 libgbm1，桌面机自带）。
-
-
-方式二：AppImage（免安装，可放 U 盘）
-----------------------------------------------------------------
-  chmod +x hwplayer-x86_64.AppImage
+AppImage：
+  chmod +x hwplayer-x86_64.AppImage        # Windows 解压 ZIP 会丢执行权限
   ./hwplayer-x86_64.AppImage
 
-  若提示缺 FUSE:
-    ./hwplayer-x86_64.AppImage --appimage-extract
-    ./squashfs-root/AppRun
+注意：deb 与 AppImage 都把 libmpv + ffmpeg 解码链、X11/字体等运行时库
+内置在包内，/usr/lib、/lib、/etc/ld.so.conf 一律不写入，离线机可直接安装。
+libGL/libEGL 由目标机显卡驱动提供，需在图形桌面会话中运行。
 
-
-选择文件夹
+排障：若自动续播仍有异常
 ----------------------------------------------------------------
-  点「浏览…」会调用系统原生文件对话框，依次尝试:
-      zenity (GTK) -> kdialog (KDE/UKUI) -> yad -> qarma
-  麒麟上想用原生对话框（可选，不装也能用）:
-      sudo apt install zenity
-  都没有时自动打开内置目录浏览器，功能不受影响。
-  输入框支持 ~ 展开、带引号路径、file:// URI，回车即导入。
+  HWPLAYER_DEBUG=1 /usr/bin/hwplayer 2> ~/hwplayer.log
+  （AppImage：HWPLAYER_DEBUG=1 ./hwplayer-x86_64.AppImage 2> ~/hwplayer.log）
 
+  日志含义：
+    [pump] END_FILE reason=0   mpv 已正常报告「这首歌播完了」
+    [advance] from=N song=...  界面已切到下一首
+    [poll] pos/dur/paused/eof  每 40 帧采样的播放状态
 
-源码
-----------------------------------------------------------------
-  source/ 是本次改动后的完整 crate（Cargo.toml + Cargo.lock + src/），
-  与交付二进制完全对应，可直接编译:
-      cd source && cargo build --release
-  需要 Rust stable（上游 Cargo.toml 写的 rust-version=1.82 已失真，
-  实际依赖链要求 >=1.89 的 edition2024 支持）与其他系统依赖，
-  详见 README.md 的「复现构建」。
-
-  hwplayer-0.1.0-4.patch 是相对上游的 unified diff，可:
-      git apply hwplayer-0.1.0-4.patch
-  改动文件: src/app.rs, src/mpv.rs, src/main.rs, src/config.rs,
-            src/lyrics_online/amll.rs
-
-
-常见问题
-----------------------------------------------------------------
-  1) 启动报 OpenGL / EGL 错误
-     显卡驱动未就绪。检查: glxinfo | grep "OpenGL renderer"
-     风华显卡需装官方驱动或 Mesa。切勿用本包覆盖系统 libGL/libEGL。
-
-  2) 界面中文显示方块
-     deb 已内置文泉驿字体；AppImage 通过 APPDIR 兜底加载。
-     若仍异常: sudo apt install fonts-wqy-zenhei
-
-  3) dpkg -i 报依赖缺失 libgl1/libegl1/libdrm2/libgbm1
-     说明是精简系统、没装显卡 GL 栈，这类机器本来也渲染不了界面。
-     先装显卡驱动，或改用 AppImage。
-
-  4) 更多排障见 run-on-kylin.md
+  若只有 END_FILE 没有 advance，说明切歌保护窗/时长门槛拦住了；
+  若两者都没有，说明 mpv 没报告结束（音频设备或文件本身问题）。
+  把 hwplayer.log 发回即可定位。

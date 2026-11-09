@@ -1,4 +1,5 @@
 * text=auto
+.gitattributes text eol=lf
 
 # Rust 源码与构建脚本在 Linux（银河麒麟）上构建，必须保持 LF，
 # 否则 checkout 成 CRLF 后 `bash kylin/scripts/build_deb.sh` 会报 bad interpreter

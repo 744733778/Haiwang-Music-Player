@@ -22,6 +22,11 @@ const PERCENTILE: f32 = 0.95;
 const GAIN_MIN_DB: f32 = -20.0;
 const GAIN_MAX_DB: f32 = 20.0;
 
+/// 「只衰减」时的增益上限：−1 dBFS，给下游（EQ / 淡入淡出 / 系统混音）留余量。
+/// 对应线性 10^(−1/20) ≈ 0.891。上游 BYD-AplayerFoliaMix 在
+/// 「等响度安全增益」修复里用的就是这个值，理由同样是 0 dBFS 已经有削波风险。
+pub const HEADROOM_DB: f32 = -1.0;
+
 // ------------------------------------------------------------------ 双二阶滤波
 
 #[derive(Clone, Copy)]
@@ -209,12 +214,20 @@ fn analyze_with_mpv(path: &Path, tmp: &Path, max_sec: u32, target_db: f32) -> Op
     if std::env::var("RM_KEEP_WAV").is_err() {
         let _ = std::fs::remove_file(tmp);
     }
-    let (samples, rate) = parse_wav(&bytes?)?;
-    analyze_samples(&samples, rate, target_db)
+    let (samples, rate, true_peak) = parse_wav(&bytes?)?;
+    let mut rep = analyze_samples(&samples, rate, target_db)?;
+    // 下混可能相位抵消，真实峰值以逐声道为准
+    if true_peak.is_finite() && true_peak > rep.peak {
+        rep.peak = true_peak;
+    }
+    Some(rep)
 }
 
-/// 极简 WAV 解析：够用即可（mpv 的 wav 输出是标准 RIFF，pcm_s16le 为主）
-fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32)> {
+/// 极简 WAV 解析：够用即可（mpv 的 wav 输出是标准 RIFF，pcm_s16le 为主）。
+/// 返回 (单声道下混采样, 采样率, 真实峰值)。
+/// 峰值必须按**每个声道**取绝对值最大：下混是各声道求和再平均，
+/// 反相内容会互相抵消，用下混信号算峰值会低估，峰值保护就会放行削波。
+fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32, f32)> {
     if b.len() < 44 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
         return None;
     }
@@ -251,6 +264,7 @@ fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32)> {
         return None;
     }
     let ch = channels as usize;
+    let mut peak = 0.0f32;
     let mut out = Vec::with_capacity(data.len() / 2 / ch);
     match (bits, float) {
         (16, _) => {
@@ -258,7 +272,9 @@ fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32)> {
                 let mut acc = 0i32;
                 for c in 0..ch {
                     let i = c * 2;
-                    acc += i16::from_le_bytes([frame[i], frame[i + 1]]) as i32;
+                    let v = i16::from_le_bytes([frame[i], frame[i + 1]]) as i32;
+                    peak = peak.max((v as f32 / 32768.0).abs());
+                    acc += v;
                 }
                 out.push(acc as f32 / ch as f32 / 32768.0);
             }
@@ -271,6 +287,7 @@ fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32)> {
                     let v = ((frame[i + 2] as i32) << 16)
                         | ((frame[i + 1] as i32) << 8)
                         | frame[i] as i32;
+                    peak = peak.max((v as f32 / 8_388_608.0).abs());
                     acc += (v << 8) >> 8;
                 }
                 out.push(acc as f32 / ch as f32 / 8_388_608.0);
@@ -281,14 +298,18 @@ fn parse_wav(b: &[u8]) -> Option<(Vec<f32>, u32)> {
                 let mut acc = 0f32;
                 for c in 0..ch {
                     let i = c * 4;
-                    acc += f32::from_le_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]);
+                    let v = f32::from_le_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]);
+                    if v.is_finite() {
+                        peak = peak.max(v.abs());
+                    }
+                    acc += v;
                 }
                 out.push(acc / ch as f32);
             }
         }
         _ => return None,
     }
-    Some((out, rate))
+    Some((out, rate, peak))
 }
 
 // ------------------------------------------------------------------ 标签
@@ -342,12 +363,18 @@ pub fn read_tags(path: &Path) -> Tags {
 
 // ------------------------------------------------------------------ 缓存
 
+/// 缓存结构版本。2 = 峰值改为「逐声道真实峰值」+ 增益改成只衰减语义。
+/// 老条目里的 peak 是单声道下混算出来的，会低估真实峰值，必须重测。
+pub const CACHE_VERSION: u8 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct Entry {
     pub gain_db: f32,
     pub peak: f32,
     pub size: u64,
     pub mtime: i64,
+    #[serde(default)]
+    pub ver: u8,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -386,7 +413,7 @@ impl Store {
         let key = song.path.to_string_lossy().into_owned();
         let e = self.items.get(&key)?;
         let (size, mtime) = file_sig(&song.path)?;
-        if e.size == size && e.mtime == mtime {
+        if e.size == size && e.mtime == mtime && e.ver == CACHE_VERSION {
             Some(e)
         } else {
             None
@@ -450,25 +477,34 @@ pub fn resolve_gain(cfg: &crate::config::LoudnessCfg, song: &Song, store: &Store
     };
 
     let Some(gain) = gain else {
-        return Some(cfg.missing_gain_db);
+        // 还没测过、也没有标签：走缺省增益，但同样要过安全钳制
+        return Some(clamp_gain(cfg, cfg.missing_gain_db, None));
     };
-    let mut db = gain + cfg.preamp_db;
+    Some(clamp_gain(cfg, gain + cfg.preamp_db, peak))
+}
+
+/// mp3gain 式安全钳制（对齐上游 `a1689638` 「等响度安全增益」）：
+///  a) 默认只衰减不放大，上限 −1 dBFS，给下游 EQ / 淡入淡出 / 系统混音留余量；
+///  b) 峰值缺失或无效时，绝不把「不知道峰值」当成「可以放大」的许可；
+///  c) 只有用户显式打开 `allow_boost`，才恢复完整 ReplayGain 对齐（接受底噪与削波风险）。
+fn clamp_gain(cfg: &crate::config::LoudnessCfg, db: f32, peak: Option<f32>) -> f32 {
+    if !db.is_finite() {
+        return 0.0;
+    }
+    let mut ceiling_db = if cfg.allow_boost {
+        f32::INFINITY
+    } else {
+        HEADROOM_DB
+    };
     if cfg.peak_protection {
-        if let Some(p) = peak {
-            if p.is_finite() && p > 0.0 {
-                // 用峰值把增益压到不削波（等价于 min(linear, 1/peak)）
-                let limit = -20.0 * p.log10();
-                if db > limit {
-                    db = limit;
-                }
-            } else if db > 0.0 {
-                db = 0.0;
-            }
-        } else if db > 0.0 {
-            db = 0.0;
+        match peak.filter(|p| p.is_finite() && *p > 0.0) {
+            // 用峰值把增益压到不削波（等价于 min(linear, 1/peak)）
+            Some(p) => ceiling_db = ceiling_db.min(-20.0 * p.log10()),
+            // 没有峰值数据：最多到 0 dBFS，不放大
+            None => ceiling_db = ceiling_db.min(0.0),
         }
     }
-    Some(db.clamp(GAIN_MIN_DB, GAIN_MAX_DB))
+    db.min(ceiling_db).clamp(GAIN_MIN_DB, GAIN_MAX_DB)
 }
 
 #[cfg(test)]
@@ -609,46 +645,111 @@ mod e2e_tests {
         assert!(g < 1.0, "峰值保护没生效：{}", g);
     }
 
+    #[test]
+    fn default_gain_only_attenuates_with_headroom() {
+        let cfg = crate::config::LoudnessCfg::default();
+        // 响的照压（峰值上限只封顶正向增益，不会把 -8dB 再往下拽）
+        assert_eq!(clamp_gain(&cfg, -8.0, Some(0.9)), -8.0);
+        assert_eq!(clamp_gain(&cfg, 6.0, Some(1.0)), HEADROOM_DB);
+        // 安静的：默认不抬，且统一留 1dB 余量
+        assert_eq!(clamp_gain(&cfg, 6.0, Some(0.05)), HEADROOM_DB);
+        // 峰值缺失更不是放大的理由
+        assert_eq!(clamp_gain(&cfg, 6.0, None), HEADROOM_DB);
+        // 关掉峰值保护也一样不会变成放大
+        let mut no_peak_prot = cfg.clone();
+        no_peak_prot.peak_protection = false;
+        assert_eq!(clamp_gain(&no_peak_prot, 5.0, None), HEADROOM_DB);
+    }
+
+    #[test]
+    fn allow_boost_restores_full_replaygain() {
+        let mut cfg = crate::config::LoudnessCfg::default();
+        cfg.allow_boost = true;
+        // 峰值 0.9 → 上限 ≈ +0.92dB，抬不到 +12
+        let g = clamp_gain(&cfg, 12.0, Some(0.9));
+        assert!(g < 1.0 && g > 0.8, "峰值保护应生效: {g}");
+        // 峰值 0.05 有 26dB 余量，+12dB 可以放行
+        assert_eq!(clamp_gain(&cfg, 12.0, Some(0.05)), 12.0);
+        // 开了正向放大但完全没有峰值数据：仍然不放大
+        assert_eq!(clamp_gain(&cfg, 12.0, None), 0.0);
+    }
+
+    #[test]
+    fn out_of_phase_stereo_peak_is_per_channel() {
+        // 左右反相且幅度相同：单声道下混几乎为零，但真实峰值是 0.8。
+        // 旧实现用下混算峰值 → peak≈0 → 1/peak 无穷大，峰值保护形同虚设。
+        let mut data = Vec::new();
+        for i in 0..2000 {
+            let v: i16 = if i % 2 == 0 { 26214 } else { -26214 };
+            data.extend_from_slice(&v.to_le_bytes());
+            data.extend_from_slice(&(-v).to_le_bytes());
+        }
+        let wav = tiny_wav(&data, 2, 16, 48000);
+        let (samples, rate, peak) = parse_wav(&wav).expect("应能解析");
+        assert_eq!(rate, 48000);
+        assert!(samples.iter().all(|s| s.abs() < 0.01), "下混应抵消");
+        assert!((peak - 0.8).abs() < 0.01, "峰值必须按声道取: {peak}");
+    }
+
+    /// 造一个最小可解析的 PCM WAV
+    fn tiny_wav(data: &[u8], channels: u16, bits: u16, rate: u32) -> Vec<u8> {
+        let block = channels * bits / 8;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * block as u32).to_le_bytes());
+        b.extend_from_slice(&block.to_le_bytes());
+        b.extend_from_slice(&bits.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    /// 造一个真实存在的临时 WAV + 与之签名匹配的缓存条目。
+    /// 以前依赖 /tmp/test1k.wav，机器上没有这个文件时用例会静默走「无数据」分支，
+    /// 变成永远测不到峰值保护，所以在测试里自己生成。
     fn song_with_store_gain(gain: f32, peak: f32) -> (Song, Store) {
-        let path = std::path::PathBuf::from("/tmp/definitely-not-a-real-file.mp3");
+        let mut data = Vec::new();
+        for i in 0..4800 {
+            let v: i16 = if i % 2 == 0 { 26214 } else { -26214 };
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let wav = tiny_wav(&data, 1, 16, 48000);
+        let real = std::env::temp_dir().join(format!(
+            "hwplayer-loud-test-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&real, &wav).expect("写测试 WAV");
+        let (size, mtime) = file_sig(&real).expect("文件刚写完，签名必须拿得到");
+
         let song = Song {
-            path: path.clone(),
+            path: real.clone(),
             title: "t".into(),
             artist: "a".into(),
             album: "b".into(),
             duration_ms: 1000,
         };
         let mut store = Store::default();
-        // 直接塞一条「签名匹配」的记录：文件不存在时 file_sig 返回 None，
-        // get_valid 会判为无效，所以这里给一个真实存在的文件来造签名。
-        let real = std::path::Path::new("/tmp/test1k.wav");
-        if let Some((size, mtime)) = file_sig(real) {
-            store.put(
-                &path,
-                Entry {
-                    gain_db: gain,
-                    peak,
-                    size,
-                    mtime,
-                },
-            );
-            // get_valid 用的是 song.path，需要用真实文件路径才能验证；
-            // 这里改用真实路径的 Song
-            let song2 = Song {
-                path: real.to_path_buf(),
-                ..song
-            };
-            store.put(
-                real,
-                Entry {
-                    gain_db: gain,
-                    peak,
-                    size,
-                    mtime,
-                },
-            );
-            return (song2, store);
-        }
+        store.put(
+            &real,
+            Entry {
+                gain_db: gain,
+                peak,
+                size,
+                mtime,
+                ver: CACHE_VERSION,
+            },
+        );
         (song, store)
     }
 }

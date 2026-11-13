@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod hotkeys;
 mod library;
 mod loudness;
 mod lyrics;

@@ -20,6 +20,8 @@ ureq = "2"
 flate2 = "1"
 md5 = "0.7"
 base64 = "0.22"
+# 全局热键（↑↓ 音量、←→ 切歌）。Linux/X11 走 XGrabKey，和 txt-reader 同款方案。
+global-hotkey = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"

@@ -6,7 +6,7 @@
 
 <p align="center">libmpv + egui 写的桌面音乐播放器 · 纯本地 · Windows 解压即用 · 也可跑在银河麒麟 / Linux</p>
 
-<p align="center"><b>当前版本 0.1.0-5</b> —— 真正修好「一首播完不会自动播下一首」</p>
+<p align="center"><b>当前版本 0.1.0-6</b> —— 等响度安全增益 + 全局热键</p>
 
 ---
 
@@ -16,33 +16,40 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| Windows 7 / 10 / 11 (64 位) | `haiwang-music-player-win64-0.1.0-5.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
-| 银河麒麟 V10 SP1 (x86_64) | `hwplayer_0.1.0-5_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
+| Windows 7 / 10 / 11 (64 位) | `haiwang-music-player-win64-0.1.0-6.zip` | 解压即用，内含 `rust-music.exe` + `libmpv-2.dll` + `icon.png` |
+| 银河麒麟 V10 SP1 (x86_64) | `hwplayer_0.1.0-6_amd64.deb` | **离线自包含**，`dpkg -i` 装完即用，无需预装 libmpv |
 | 银河麒麟 / 其它 Linux | `hwplayer-x86_64.AppImage` | 免安装单文件，跑前 `chmod +x` |
-| 排障 / 二次开发 | `hwplayer-linux-x86_64.elf`、`hwplayer-0.1.0-5.patch`、`SHA256SUMS` | 原始 ELF、完整补丁、校验值 |
+| 排障 / 二次开发 | `hwplayer-linux-x86_64.elf`、`hwplayer-0.1.0-6.patch`、`SHA256SUMS` | 原始 ELF、完整补丁、校验值 |
 
 都在 [Releases](../../releases) 里。
 
 - **项目图标**：`icon.png`
 - **麒麟 / Linux 版说明**：构建方式、依赖取舍、排障见 [`kylin/README.md`](kylin/README.md) 与 [`kylin/run-on-kylin.md`](kylin/run-on-kylin.md)
 
-### 0.1.0-5 修了什么
+### 0.1.0-6 改了什么
 
-**一首播完不会自动播下一首** —— 0.1.0-4 的修复在银河麒麟实机上仍然失效，这一版才是真正的修复。两个平台同一份源码，Windows 与 Linux 一起更新。
+这一版从上游两个项目移植了改动：**等响度安全增益**（修一个跨平台 bug）和 **全局热键**（新功能）。
 
-0.1.0-4 把 mpv 改成了 `keep-open=yes`，靠「进度 ≥ 时长 − 0.2 秒 且 `pause=1`」判定播完。问题在于：`keep-open=yes` 会让 mpv 把文件挂在末尾并暂停，**`MPV_EVENT_END_FILE` 因此永远不会发出**（mpv 的设计，所有版本皆然）；而真实声卡有缓冲、不同格式末帧位置不同、`pause` 也可能保持 0，三个条件任一不成立就永远卡在最后一首。构建容器里三个条件恰好擦边满足，所以被误判为已修复。
+#### 等响度：安静歌曲的「沙沙」声
 
-0.1.0-5 的做法：
+上游 `BYD-AplayerFoliaMix` 在 `a1689638`（等响度安全增益）修了 `ReplayGainAudioProcessor.setGain()`，对照后确认我们的 `src/loudness.rs` 有同一个问题：正向增益最高允许 `+20 dB`，且峰值缺失时被当成「可以放大」。安静曲目被强行抬到目标响度，底噪同步抬高，叠加下游增益后顶到 0 dBFS 硬削波，听感就是发沙的失真。
 
-- 改回 **`keep-open=no`**：EOF 时 mpv 卸载文件并发出且仅发出一次 `END_FILE(reason=EOF)`，与 libmpv 版本、音频后端、音频格式全部解耦
-- `poll_mpv()` 以该事件为主判据；`eof-reached` 属性与放宽到 1 秒容差的进度判据只作兜底
-- 事件泵只认 `EOF(0)` / `ERROR(4)`，忽略主动 `loadfile replace` 产生的 `STOP(2)`，避免连锁跳歌
-- 切歌前排空滞留事件；500ms 保护窗内到达的信号**直接丢弃而不缓存**；本曲至少播放 700ms 才允许续播 —— 坏文件 / 无声卡造成的「瞬间 EOF」不会把整个列表跳光
-- `HWPLAYER_DEBUG=1` 会打印 `[pump] END_FILE reason=` 与 `[advance] from=N`，便于实机抓日志排障
+现在默认走 mp3gain 式「只衰减、不放大」：`resolve_gain()` 统一过 `clamp_gain()`，上限压到 **−1 dBFS**（线性 ≈0.891，给 EQ / 淡入淡出 / 系统混音留余量），峰值有效时再取 `min(上限, 1/peak)`，峰值缺失时最高只到 0 dBFS。只有显式勾选设置里的「允许正向放大」才恢复完整 ReplayGain 对齐。
 
-> **别下旧包**：v4 与 0.1.0-4 两个发布页都已加横幅指向本版，旧包仍带这个 bug。
+同时修掉一个自己的测量缺陷：峰值原来取自单声道下混，左右反相内容会互相抵消、`peak` 被严重低估，`1/peak` 形同虚设。现在按**每个声道**取绝对值最大，缓存结构升到 `ver=2`，旧条目自动重测。
 
-顺带（0.1.0-4 已有）：文件夹输入框支持回车导入、自动去掉粘贴时带的引号、解码 `file://` 路径，也支持把文件夹直接拖进窗口；Linux 侧程序更名为 `hwplayer`，并沿用旧 `~/.config/rust-music` 配置。
+实测（6 秒 440Hz，容器内真实 libmpv 解码）：安静曲目（幅度 0.05）需要 `+11.07 dB`，默认只施加 `−1.0 dB`，勾选放大后才给 `+11.07 dB`；响亮曲目 `−14.04 dB` 两种模式一致。
+
+#### 全局热键：↑/↓ 音量、←/→ 切歌
+
+移植 `txt-reader` 的 Linux 方案：`global-hotkey 0.6` 在 X11 下走 `XGrabKey`，不需要 root、不用常驻守护进程、不新增系统库。工作线程收 `GlobalHotKeyEvent` 投进动作队列，主线程在 `update()` 里消费；切歌 220ms / 音量 45ms 去抖，输入框聚焦时自动让路，音量改动攒 800ms 再落盘；注册失败（Wayland 会话 / 键位被占）自动退回窗口内方向键，设置里能看到具体状态。
+
+> ⚠️ **方向键是不带修饰键注册的，运行期间会被本程序独占**，其他程序收不到方向键。不需要就在「设置 → 全局热键」关掉，关掉后只在窗口内生效。代码里**没有平台门**，所以 Windows 版同样会启用；该功能目前只在 Linux/X11 实机验证过，Windows 侧请勿默认依赖，觉得碍事就直接关掉。
+
+#### 历史版本
+
+- **0.1.0-5**：真正修好「一首播完不会自动播下一首」——改回 `keep-open=no`，以 `END_FILE(EOF)` 事件为主判据，配合每曲只切一次、500ms 保护窗、700ms 最短播放时长。0.1.0-4 的 `keep-open=yes` 方案在实机上仍失效。
+- v4 / 0.1.0-4 发布页已加横幅指向新版，旧包带已知 bug，请勿下载。
 
 
 ## 已实现
@@ -84,9 +91,11 @@ egui 的 `show_viewport_immediate + with_transparent(true)` 在 Windows 上**不
 
 移植自 BYD-AplayerFoliaMix 的 `LoudnessAnalyzer.kt` / `ReplayGainController.kt` / `ReplayGainAudioProcessor.kt`：
 
-1. **测**：用一个独立的 mpv 实例把文件解码成 48kHz 单声道 WAV（格式覆盖面和播放器完全一致，ape/dsf/wv 都在内）→ 单声道化 → K 加权（38Hz 高通 Q0.5 + 1.5kHz +4dB 高架 Q0.707）→ 400ms 窗口 RMS → 取 95 分位 → `gain = 目标(-18dBFS) - 20log10(rms)`，夹在 ±20dB；同时记峰值
-2. **存**：`loudness.json` 按「路径 + 文件大小 + 修改时间」缓存，文件变了自动重测；扫描边测边存，可以中断续跑
-3. **用**：文件里的 ReplayGain 标签优先 → 本地测量（可自动/手动）→ 缺省增益；加 preamp；峰值保护时 `gain = min(gain, -20log10(peak))`；通过 mpv 的 `af` 链（`volume` 滤镜）生效
+1. **测**：用一个独立的 mpv 实例把文件解码成 48kHz 单声道 WAV（格式覆盖面和播放器完全一致，ape/dsf/wv 都在内）→ 单声道化 → K 加权（38Hz 高通 Q0.5 + 1.5kHz +4dB 高架 Q0.707）→ 400ms 窗口 RMS → 取 95 分位 → `gain = 目标(-18dBFS) - 20log10(rms)`，夹在 ±20dB；峰值按**每个声道**取绝对值最大（下混求和会相位抵消，用下混信号算峰值会低估）
+2. **存**：`loudness.json` 按「路径 + 文件大小 + 修改时间 + 缓存版本」缓存，文件变了或版本升级自动重测；扫描边测边存，可以中断续跑
+3. **用**：文件里的 ReplayGain 标签优先 → 本地测量（可自动/手动）→ 缺省增益；加 preamp；最后统一过 `clamp_gain()` —— 默认**只衰减不放大**、封顶 −1 dBFS 给下游留余量，峰值保护时再取 `min(上限, 1/peak)`，峰值缺失绝不作为放大许可；只有勾选「允许正向放大」才恢复完整 ReplayGain 对齐。通过 mpv 的 `af` 链（`volume` 滤镜）生效
+
+> **0.1.0-6 修的 bug**：此前正向增益最高 +20 dB 且峰值缺失被当成「可以放大」，安静曲目被抬到目标响度时底噪同步抬高、下游再叠加就顶到 0 dBFS 削波，听感是「沙沙」的失真。缓存结构同时升到 `ver=2`，旧条目（峰值来自下混、会低估）自动重测。详见上方「0.1.0-6 改了什么」。
 
 > 移植时修了原实现的一个 bug：RBJ 高架的 `a1` 应为 `2*((A-1)-(A+1)cos)`，Kotlin 版写成了负号，等于把滤波器接反了。修好后 A=1（0dB）时 b≡a，退化为直通，`shelf_is_flat_at_0db` 这个单测就是在钉这个行为。
 >
@@ -235,7 +244,8 @@ src/
     convert.rs       QRC / KRC / TTML → 增强 LRC
     qq_crypt.rs      QQ QRC 的魔改 3DES 解密
     qq.rs / netease.rs / kugou.rs / amll.rs
-  loudness.rs        等响度：K 加权测量、ReplayGain 标签、缓存、增益结算
+  loudness.rs        等响度：K 加权测量、ReplayGain 标签、缓存、安全增益钳制
+  hotkeys.rs         全局热键：GlobalHotKeyManager + 动作队列 + 去抖
   lyric_win32.rs     Windows 桌面歌词窗（分层窗口 + GDI 自绘，不依赖 GL 透明）
 ```
 
@@ -246,3 +256,4 @@ src/
 - 播放进度轮询刷新（播放 50ms / 暂停 100ms），未做 mpv 属性事件订阅
 - 桌面歌词窗的拖动/透明只做了 Windows 实现；Linux 仍用 egui 子 viewport
 - 逐字高亮取决于源：AMLL / QQ / 酷狗 有逐字，网易云通常只有逐行
+- 全局热键只在 Linux/X11 做过实机验证；Windows 会用 `RegisterHotKey` 注册且实测能成功，但无修饰键的方向键会被独占，不想要就在设置里关掉

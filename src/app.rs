@@ -112,6 +112,14 @@ pub struct App {
     /// 本曲开始播放的时刻：太短就“播完”属于异常（坏文件/无声卡瞬间 EOF），不当作续播
     track_started_at: Instant,
 
+    /// 全局热键：首帧才注册（此时 egui Context 就绪，且确定在主线程）
+    hotkeys: crate::hotkeys::Hotkeys,
+    hotkey_ready: bool,
+    /// 各动作上次触发时间，用于去抖（连按 ←/→ 不会连跳十几首）
+    hotkey_last: [Option<Instant>; 4],
+    /// 音量改动攒 800ms 再写配置，避免按住 ↑/↓ 时狂写磁盘
+    volume_dirty_at: Option<Instant>,
+
     show_settings: bool,
     /// 桌面歌词窗口位置只在首帧设置，之后交给系统拖动，避免每帧回写导致抖动/不跟手
     #[cfg(not(windows))]
@@ -162,6 +170,10 @@ impl App {
             eof_guard_until: None,
             ended_for_track: false,
             track_started_at: Instant::now(),
+            hotkeys: crate::hotkeys::Hotkeys::inactive("等待初始化"),
+            hotkey_ready: false,
+            hotkey_last: [None; 4],
+            volume_dirty_at: None,
             show_settings: false,
             original_order: None,
             #[cfg(not(windows))]
@@ -334,6 +346,9 @@ impl App {
         }
         self.current = Some(idx);
         let song = self.songs[idx].clone();
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            eprintln!("[switch] idx={} song={}", idx, song.display());
+        }
         // 先定增益再 load，避免开头一瞬间音量跳一下
         self.apply_gain(&song);
         if let Some(m) = &self.mpv {
@@ -369,6 +384,9 @@ impl App {
         }
         let gain = crate::loudness::resolve_gain(&cfg, song, &self.loud_store);
         self.applied_gain = gain;
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            eprintln!("[gain] {} -> {:?} dB", song.display(), gain);
+        }
         if let Some(m) = &self.mpv {
             m.set_gain_db(gain);
         }
@@ -391,6 +409,7 @@ impl App {
                                     peak: rep.peak,
                                     size,
                                     mtime,
+                                    ver: crate::loudness::CACHE_VERSION,
                                 },
                             ));
                         }
@@ -440,6 +459,7 @@ impl App {
                                 peak: rep.peak,
                                 size,
                                 mtime,
+                                ver: crate::loudness::CACHE_VERSION,
                             };
                             store.put(&s.path, e.clone());
                             store.save(); // 边测边存，中途关掉也不白测
@@ -550,6 +570,103 @@ impl App {
             None => 0,
         };
         self.play_index(i);
+    }
+
+    // ---------------- 全局热键 / 音量 ----------------
+
+    /// 首帧才真正注册：此时 egui Context 就绪，且确定跑在主线程上
+    fn init_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.hotkey_ready {
+            return;
+        }
+        self.hotkey_ready = true;
+        self.hotkeys = crate::hotkeys::Hotkeys::install(ctx, self.cfg.hotkey_enabled);
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            eprintln!("[hotkey] {}", self.hotkeys.status);
+        }
+    }
+
+    fn poll_hotkeys(&mut self, ctx: &egui::Context) {
+        self.init_hotkeys(ctx);
+
+        // 正在输入框里打字时，方向键归输入框，别拿来切歌/调音量
+        let typing = ctx.wants_keyboard_input();
+        for a in self.hotkeys.drain() {
+            if typing {
+                continue;
+            }
+            self.act_hotkey(a);
+        }
+
+        // 全局热键没生效时（Wayland / 键位被其他程序占用 / 用户关掉）兜底：
+        // 窗口有焦点也能用方向键，功能不至于完全消失。
+        if !self.hotkeys.active && !typing {
+            let acts = ctx.input(|i| {
+                let mut v: Vec<crate::hotkeys::Action> = Vec::new();
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    v.push(crate::hotkeys::Action::VolumeUp);
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    v.push(crate::hotkeys::Action::VolumeDown);
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    v.push(crate::hotkeys::Action::Prev);
+                }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    v.push(crate::hotkeys::Action::Next);
+                }
+                v
+            });
+            for a in acts {
+                self.act_hotkey(a);
+            }
+        }
+
+        // 音量写盘防抖：按住 ↑/↓ 时不要每个事件都落一次盘
+        if let Some(t) = self.volume_dirty_at {
+            if t.elapsed() >= Duration::from_millis(800) {
+                self.cfg.save();
+                self.volume_dirty_at = None;
+            }
+        }
+    }
+
+    fn act_hotkey(&mut self, a: crate::hotkeys::Action) {
+        let now = Instant::now();
+        if let Some(t) = self.hotkey_last[a.slot()] {
+            if now.duration_since(t) < a.min_gap() {
+                return;
+            }
+        }
+        self.hotkey_last[a.slot()] = Some(now);
+        if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+            eprintln!("[hotkey] action={:?} volume={:.0}", a, self.cfg.volume);
+        }
+        match a {
+            crate::hotkeys::Action::VolumeUp => {
+                let step = self.cfg.hotkey_volume_step as f64;
+                self.change_volume(step);
+            }
+            crate::hotkeys::Action::VolumeDown => {
+                let step = self.cfg.hotkey_volume_step as f64;
+                self.change_volume(-step);
+            }
+            crate::hotkeys::Action::Prev => self.prev(),
+            crate::hotkeys::Action::Next => self.next(),
+        }
+    }
+
+    fn change_volume(&mut self, delta: f64) {
+        let v = (self.cfg.volume + delta).clamp(0.0, 130.0);
+        if (v - self.cfg.volume).abs() < 0.01 {
+            return;
+        }
+        self.cfg.volume = v;
+        if let Some(m) = &self.mpv {
+            m.set_volume(v);
+        }
+        self.status = format!("音量 {:.0}%", v);
+        self.volume_dirty_at = Some(Instant::now());
     }
 
     fn poll_mpv(&mut self) {
@@ -1195,7 +1312,7 @@ impl App {
                     egui::RichText::new(
                         "把每首歌的响度拉到同一水平。先看文件里的 ReplayGain 标签，没有就本地测：\
                         解码 → K 加权（38Hz 高通 + 1.5kHz +4dB 高架）→ 400ms 窗口 RMS → \
-                        95 分位 → 目标响度 − 实测，夹在 ±20dB。",
+                        95 分位 → 目标响度 − 实测。默认只衰减不放大（上限 −1 dBFS），要抬音量得手动允许。",
                     )
                     .size(12.0)
                     .color(egui::Color32::from_gray(150)),
@@ -1227,6 +1344,18 @@ impl App {
                         .changed();
                     loud_changed |= ui
                         .checkbox(&mut lc.peak_protection, "峰值保护（用测量峰值限制增益，避免削波）")
+                        .changed();
+                    loud_changed |= ui
+                        .checkbox(
+                            &mut lc.allow_boost,
+                            "允许正向放大（关闭时只衰减，保留 1 dB 余量）",
+                        )
+                        .on_hover_text(
+                            "关闭（推荐）：mp3gain 式只压不抬。安静的歌不会被抬到底噪、也不会削波，\
+                             整体再留 1 dB 余量给 EQ 和系统混音。\n\
+                             打开：完整 ReplayGain 对齐，安静曲目抬到目标响度，但底噪同步变大，\
+                             峰值数据不准时会削波。",
+                        )
                         .changed();
                     loud_changed |= ui
                         .checkbox(&mut lc.auto_analyze, "没有标签时自动现场测量（播放时后台跑）")
@@ -1273,6 +1402,42 @@ impl App {
                         self.apply_gain(&s);
                     }
                 }
+
+                ui.separator();
+                ui.heading("全局热键");
+                ui.label(
+                    egui::RichText::new(
+                        "↑ 音量加，↓ 音量减，← 上一首，→ 下一首。X11 下用 XGrabKey 注册，\
+                         窗口不在前台也生效。注意：运行期间方向键会被本程序独占，\
+                         其他程序收不到方向键，不需要时请关掉（关掉后仅在窗口内可用）。",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(150)),
+                );
+                let mut hk_on = self.cfg.hotkey_enabled;
+                if ui.checkbox(&mut hk_on, "启用全局方向键热键").changed() {
+                    self.cfg.hotkey_enabled = hk_on;
+                    self.hotkeys = crate::hotkeys::Hotkeys::install(ctx, hk_on);
+                    self.cfg.save();
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.cfg.hotkey_volume_step, 1.0..=20.0)
+                            .text("每次调整")
+                            .suffix(" %"),
+                    )
+                    .changed()
+                {
+                    self.cfg.save();
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "状态：{}｜当前音量 {:.0}%",
+                        self.hotkeys.status, self.cfg.volume
+                    ))
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(170)),
+                );
 
                 ui.separator();
                 if ui
@@ -1666,6 +1831,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_hotkeys(ctx);
         self.poll_mpv();
         self.poll_download();
         self.poll_loudness();

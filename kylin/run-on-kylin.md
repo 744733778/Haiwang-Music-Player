@@ -14,7 +14,7 @@
 sudo dpkg -r haiwang-music 2>/dev/null || true
 
 # 离线直接安装（Depends 仅 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i hwplayer_0.1.0-5_amd64.deb
+sudo dpkg -i hwplayer_0.1.0-6_amd64.deb
 
 # 运行：应用菜单里选「hwplayer」，或命令行
 hwplayer
@@ -30,6 +30,27 @@ sudo dpkg -P hwplayer
 - 安装内容：`/opt/hwplayer/`（程序 + 私有库 + 字体）、`/usr/bin/hwplayer`(启动器)、desktop、图标、文档；**不向 `/usr/lib`、`/lib`、`/etc/ld.so*` 写入任何文件**，不做 ldconfig/服务操作。
 - 若 `dpkg -i` 提示缺 `libgl1/libegl1/libdrm2/libgbm1`：说明该机是精简系统、未装显卡 GL 栈。这类机器本来也无法渲染界面；请先装好显卡驱动（风华/Mesa），或改用 AppImage。
 - 若系统缺 libmpv **不影响**本 deb —— libmpv 已随包内置（`/opt/hwplayer/lib`）。
+
+### 键盘快捷键（0.1.0-6 新增）
+
+| 按键 | 动作 |
+|---|---|
+| `↑` | 音量 +（默认每次 5%，可在设置里改） |
+| `↓` | 音量 − |
+| `←` | 上一首 |
+| `→` | 下一首 |
+
+默认注册为**全局热键**（X11 `XGrabKey`），窗口最小化、其他程序在前台时同样有效。
+两点必须知道：
+
+1. **方向键会被本程序独占**：运行期间其他程序收不到方向键。这是全局抓键的固有
+   行为，不是 bug。不需要时到「设置 → 全局热键」取消勾选，之后方向键只在
+   hwplayer 窗口内生效。
+2. **Wayland 会话**（若你的麒麟桌面切到了 Wayland）拿不到全局 grab，程序会自动
+   退回「窗口内方向键」，设置里会显示「不可用：…」。需要后台控制时请用 X11 会话
+   登录（UKUI 默认是 X11）。
+
+在输入框里打字（例如手输文件夹路径）时方向键自动让路，不会误切歌。
 
 ### 选择音乐文件夹
 

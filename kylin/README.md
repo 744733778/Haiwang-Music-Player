@@ -14,14 +14,14 @@
 | 文件 | 说明 |
 |------|------|
 | `artifacts/hwplayer-x86_64.AppImage` | **主交付物**：可直接在银河麒麟上运行的 AppImage（约 87MB，已内置 libmpv/ffmpeg、GTK/XCB 依赖、中文字体）|
-| `artifacts/hwplayer_0.1.0-5_amd64.deb` | **deb 离线自包含安装包**（约 78MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
+| `artifacts/hwplayer_0.1.0-6_amd64.deb` | **deb 离线自包含安装包**（约 78MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
 | `artifacts/hwplayer` | 编译出的原始 ELF（未打包 glibc，最高 GLIBC 需求 2.30 ≤ 2.31）|
 | `artifacts/glibc_check.txt` | GLIBC 版本需求校验结论（兼容麒麟）|
 | `assets/linuxdeploy-x86_64.AppImage` | 离线打包工具（linuxdeploy）|
 | `assets/runtime-x86_64` | 离线 type2 runtime（appimagetool 打包用，免联网下载）|
 | `assets/icon.png` / `icon_256.png` | 程序图标（256x256 为 AppImage 规范所需尺寸）|
 
-> **版本说明**：`0.1.0-5` 重新修复了「**一首播完不会自动播下一首**」——`0.1.0-4` 的做法在实机上仍会失效，本次改用 mpv 原生的 `END_FILE` 事件判定播完，不再依赖进度/暂停属性。程序名仍为 **hwplayer**。详见下方[更新记录](#更新记录)。
+> **版本说明**：`0.1.0-6` 移植了上游 `BYD-AplayerFoliaMix` 的「**等响度安全增益**」修复：默认只衰减、不放大，并保留 1 dB 余量，解决安静歌曲被抬高底噪 / 削波产生的「沙沙」声；同时移植 `txt-reader` 的 Linux 全局热键方案，`↑/↓` 调音量、`←/→` 切歌，窗口不在前台也生效。详见下方[更新记录](#更新记录)。
 
 > **兼容性结论**：主程序最高仅需求 `GLIBC_2.30`，低于麒麟 V10 SP1 的 `glibc 2.31`；AppImage **未打包 glibc**（运行时使用系统 glibc），符合发行版兼容目标。
 
@@ -52,10 +52,10 @@ chmod +x hwplayer-x86_64.AppImage
 
 ```bash
 # 离线机直接安装（Depends 仅需 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i hwplayer_0.1.0-5_amd64.deb
+sudo dpkg -i hwplayer_0.1.0-6_amd64.deb
 
 # 也可用 apt（本地文件）
-sudo apt install ./hwplayer_0.1.0-5_amd64.deb
+sudo apt install ./hwplayer_0.1.0-6_amd64.deb
 
 # 运行：应用菜单「海王音乐播放器」，或命令行
 hwplayer
@@ -101,7 +101,7 @@ haiwang/
 │   └── patch_eframe.py         # (备查) 曾尝试彻底移除 egui-wgpu 的方案，最终因 eframe 需 edition2024 未采用
 └── artifacts/                  # 构建产物与日志
     ├── hwplayer-x86_64.AppImage
-    ├── hwplayer_0.1.0-5_amd64.deb
+    ├── hwplayer_0.1.0-6_amd64.deb
     ├── hwplayer
     ├── glibc_check.txt
     └── *.log
@@ -111,7 +111,62 @@ haiwang/
 
 ## 更新记录
 
-### 0.1.0-5（当前）
+### 0.1.0-6（当前）
+
+本版把上游两个项目的新改动移植过来：`BYD-AplayerFoliaMix` 的等响度安全增益，
+`txt-reader` 的 Linux 全局热键。
+
+#### 1. 等响度：我们确实有同一个 Bug，已修
+
+上游在 `a1689638`（feat: 等响度安全增益）里改了 `ReplayGainAudioProcessor.setGain()`。
+对照我们的 `src/loudness.rs`，问题一模一样：
+
+| 项 | 上游修复前（= 我们 0.1.0-5） | 上游修复后（= 本版） |
+|---|---|---|
+| 正向增益 | 允许，最高 +20 dB | **默认不允许**，整体封顶 **−1 dBFS**（`10^(-1/20)≈0.891`） |
+| 峰值缺失 | 被当成「可以放大」 | 绝不作为放大许可 |
+| 用户开关 | 无 | 「允许正向放大」，默认关 |
+
+后果就是上游描述的那句：安静曲目被强行抬到目标响度，底噪同步抬高，
+再叠加下游增益后顶到 0 dBFS 硬削波，听感是「沙沙」的失真。
+修复后 `resolve_gain()` 统一走 `clamp_gain()`：
+
+1. 不放大时上限 −1 dB（给 EQ / 淡入淡出 / 系统混音留余量）；
+2. 峰值有效时再取 `min(上限, 1/peak)`；
+3. 峰值缺失时最高只到 0 dBFS；
+4. 只有勾选「允许正向放大」才恢复完整 ReplayGain 对齐。
+
+同时修掉一个我们自己的测量缺陷：原来峰值取自**单声道下混**，左右反相的内容
+会互相抵消，`peak` 被严重低估（极端情况下接近 0），`1/peak` 形同虚设。
+现在按**每个声道**取绝对值最大，并把缓存结构升到 `ver=2`，旧条目自动重测。
+
+实测（6 秒 440Hz，容器内真实 libmpv 解码）：
+
+| 文件 | 实测需要的增益 | 默认施加 | 允许放大后 |
+|---|---|---|---|
+| 安静（幅度 0.05） | `+11.07 dB` | **`−1.0 dB`** | `+11.07 dB` |
+| 响亮（幅度 0.90） | `−14.04 dB` | `−14.04 dB` | `−14.04 dB` |
+
+#### 2. 全局热键：`↑/↓` 音量、`←/→` 切歌
+
+照搬 `txt-reader` 的 Linux 实现：`global-hotkey 0.6`，X11 下走 `XGrabKey`，
+不需要 root、不用常驻守护进程、不需要额外系统库（`x11-dl` 运行时 dlopen，
+ELF 的 `NEEDED` 没有新增项）。
+
+- 工作线程收 `GlobalHotKeyEvent`，投进动作队列并 `request_repaint()`，
+  主线程在 `update()` 里消费（UI 状态只在主线程改）。
+- 去抖：切歌 220ms、音量 45ms，按住 `←/→` 不会连跳十几首。
+- 输入框获得焦点时自动让路，改路径时按方向键不会误切歌。
+- 音量改动攒 800ms 再落盘，避免按住 `↑` 时狂写磁盘。
+- 注册失败（Wayland 会话 / 键位被别的程序占用）时自动退回「窗口内方向键」，
+  设置里能看到具体状态。
+
+> **必须知道的取舍**：方向键是「无修饰键」注册的，运行期间会被本程序**独占**，
+> 其他程序收不到方向键（已在 Xvfb 里用 `xev` 验证：焦点在 xev 上时它一个
+> `Down` 都收不到，而 hwplayer 正常响应）。不需要时在「设置 → 全局热键」里关掉，
+> 关掉后只在窗口内生效。
+
+### 0.1.0-5
 
 **修复：一首播完仍不会自动播下一首（实机复现，真正的根因）**
 
@@ -232,7 +287,7 @@ docker run --rm -v "$PWD/out:/out" ubuntu:20.04 bash -c '
   bash /scripts/collect_libs.sh /out/libset /out/wqy-zenhei.ttc'   # 需挂载 scripts/
 # 2) 用该库集装配离线 deb（宿主执行即可）
 LIB_SRC="$PWD/out/libset" FONT_SRC="$PWD/out/wqy-zenhei.ttc" bash scripts/build_deb.sh
-# 产物: artifacts/hwplayer_0.1.0-5_amd64.deb
+# 产物: artifacts/hwplayer_0.1.0-6_amd64.deb
 ```
 
 ---

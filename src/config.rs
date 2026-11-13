@@ -57,6 +57,11 @@ pub struct LoudnessCfg {
     pub preamp_db: f32,
     /// 峰值保护：用测量到的峰值把增益压到不削波
     pub peak_protection: bool,
+    /// 允许正向放大（默认关）。
+    /// 关：mp3gain 式「只衰减、不放大」，并且整体留 1 dB 余量给下游（EQ/淡入淡出）。
+    /// 开：恢复成完整 ReplayGain 对齐，安静曲目会被抬到目标响度，但底噪同步抬高、
+    /// 遇到峰值数据不准时容易削波，是否接受由用户自己决定。
+    pub allow_boost: bool,
     /// 没有标签、也没测过时用的缺省增益
     pub missing_gain_db: f32,
     /// 没有 ReplayGain 标签时自动现场测
@@ -74,6 +79,7 @@ impl Default for LoudnessCfg {
             album_mode: false,
             preamp_db: 0.0,
             peak_protection: true,
+            allow_boost: false,
             missing_gain_db: 0.0,
             auto_analyze: true,
             target_db: crate::loudness::DEFAULT_TARGET_DB,
@@ -101,6 +107,13 @@ pub struct Config {
     pub rescan_on_start: bool,
     /// 等响度
     pub loudness: LoudnessCfg,
+    /// 全局热键（↑↓ 音量、←→ 切歌）。X11 下用 XGrabKey 注册，窗口不在前台也生效。
+    /// 注意：会独占方向键——运行期间别的程序收不到方向键，不需要时在设置里关掉。
+    #[serde(default = "default_true")]
+    pub hotkey_enabled: bool,
+    /// 每按一次 ↑/↓ 调整多少音量
+    #[serde(default = "default_volume_step")]
+    pub hotkey_volume_step: f32,
     /// 配置版本：老版本缺字段时的迁移用
     #[serde(default)]
     pub version: u32,
@@ -108,6 +121,10 @@ pub struct Config {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_volume_step() -> f32 {
+    5.0
 }
 
 /// 当前配置版本。v2：桌面歌词窗改成 Win32 分层窗口，旧版存下的
@@ -126,6 +143,8 @@ impl Default for Config {
             source_order: lyrics_online::default_order(),
             rescan_on_start: true,
             loudness: LoudnessCfg::default(),
+            hotkey_enabled: true,
+            hotkey_volume_step: 5.0,
             version: CONFIG_VERSION,
         }
     }
@@ -188,6 +207,10 @@ impl Config {
         self.lyric.font_size = self.lyric.font_size.clamp(12.0, 96.0);
         self.lyric.width = self.lyric.width.clamp(240.0, 3000.0);
         self.lyric.height = self.lyric.height.clamp(60.0, 800.0);
+        if !self.hotkey_volume_step.is_finite() {
+            self.hotkey_volume_step = 5.0;
+        }
+        self.hotkey_volume_step = self.hotkey_volume_step.clamp(1.0, 20.0);
     }
 
     pub fn save(&self) {

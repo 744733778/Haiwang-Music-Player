@@ -71,6 +71,15 @@ impl DirBrowser {
     }
 }
 
+/// 设置窗口分页。选项太多堆一页放不下，分成四类，顶部标签切换。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    Lyrics,  // 歌词外观 + 歌词源顺序
+    Audio,   // 等响度
+    Hotkey,  // 全局热键
+    Library, // 曲库缓存 + 清除数据
+}
+
 pub struct App {
     cfg: Config,
     mpv: Option<Mpv>,
@@ -78,6 +87,10 @@ pub struct App {
 
     songs: Vec<Song>,
     current: Option<usize>,
+    /// 播放列表缓存里的文件夹快照（用于判断是否文件夹变了要强制全量重扫）
+    library_folders: Vec<PathBuf>,
+    /// 缓存的文件夹列表是否与当前一致（不一致时本次扫描忽略旧签名）
+    library_cache_valid: bool,
 
     playing: bool,
     position: f64,
@@ -116,11 +129,15 @@ pub struct App {
     hotkeys: crate::hotkeys::Hotkeys,
     hotkey_ready: bool,
     /// 各动作上次触发时间，用于去抖（连按 ←/→ 不会连跳十几首）
-    hotkey_last: [Option<Instant>; 4],
+    hotkey_last: [Option<Instant>; 5],
     /// 音量改动攒 800ms 再写配置，避免按住 ↑/↓ 时狂写磁盘
     volume_dirty_at: Option<Instant>,
 
     show_settings: bool,
+    /// 设置窗口当前分页
+    settings_tab: SettingsTab,
+    /// 设置里"清除本程序所有数据"的二次确认：第一次点进入确认态，第二次才真删
+    confirm_purge: bool,
     /// 桌面歌词窗口位置只在首帧设置，之后交给系统拖动，避免每帧回写导致抖动/不跟手
     #[cfg(not(windows))]
     lyric_pos_init: bool,
@@ -150,6 +167,8 @@ impl App {
             mpv_err,
             songs: Vec::new(),
             current: None,
+            library_folders: Vec::new(),
+            library_cache_valid: false,
             playing: false,
             position: 0.0,
             duration: 0.0,
@@ -172,9 +191,11 @@ impl App {
             track_started_at: Instant::now(),
             hotkeys: crate::hotkeys::Hotkeys::inactive("等待初始化"),
             hotkey_ready: false,
-            hotkey_last: [None; 4],
+            hotkey_last: [None; 5],
             volume_dirty_at: None,
             show_settings: false,
+            settings_tab: SettingsTab::Lyrics,
+            confirm_purge: false,
             original_order: None,
             #[cfg(not(windows))]
             lyric_pos_init: false,
@@ -183,6 +204,23 @@ impl App {
             #[cfg(windows)]
             overlay_started: false,
         };
+        // 秒开：先把上次缓存的播放列表填进去，用户立刻能看到/播放，
+        // 不必等全库 lofty 读标签。后台再慢慢做增量刷新。
+        if let Some(cache) = library::load_cache() {
+            app.songs = cache.songs;
+            app.library_folders = cache.folders;
+            if app.cfg.shuffle {
+                shuffle(&mut app.songs);
+            }
+            if !app.songs.is_empty() {
+                app.status = format!(
+                    "已载入上次的曲库（{} 首），后台增量更新中…",
+                    app.songs.len()
+                );
+            }
+        }
+        // 文件夹列表变了（新增/删除），缓存可能整批失效，强制全量；否则增量。
+        app.library_cache_valid = app.library_folders == app.cfg.music_folders;
         if app.cfg.rescan_on_start && !app.cfg.music_folders.is_empty() {
             app.start_scan("正在扫描上次的文件夹…");
         }
@@ -202,12 +240,26 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        // 文件夹没变才复用旧签名；变了就当空缓存全量扫，避免残留已删文件夹里的歌
+        let old = if self.library_cache_valid {
+            self.songs.clone()
+        } else {
+            Vec::new()
+        };
+        let debug = std::env::var_os("HWPLAYER_DEBUG").is_some();
         std::thread::spawn(move || {
-            let mut all = Vec::new();
-            for f in &folders {
-                library::scan_folder(f, &mut all);
-            }
+            let t0 = std::time::Instant::now();
+            // 增量：签名未变的文件直接复用旧标签，只对新文件/改动文件读 lofty
+            let mut all = library::scan_folders_incremental(&folders, &old);
             sort_songs(&mut all);
+            if debug {
+                eprintln!(
+                    "[scan] {:.2}s, {} songs (old cache {})",
+                    t0.elapsed().as_secs_f64(),
+                    all.len(),
+                    old.len()
+                );
+            }
             let _ = tx.send(all);
         });
         self.scan_rx = Some(rx);
@@ -228,6 +280,15 @@ impl App {
         };
         if let Some(mut songs) = received {
             self.scan_rx = None;
+            // 缓存写的是 shuffle 前的稳定顺序，下次秒开再按当前设置决定是否打乱
+            library::save_cache(&library::LibraryCache {
+                version: library::CACHE_VERSION,
+                folders: self.cfg.music_folders.clone(),
+                songs: songs.clone(),
+            });
+            self.library_folders = self.cfg.music_folders.clone();
+            self.library_cache_valid = true;
+
             let cur_path = self.current.and_then(|i| self.songs.get(i).map(|s| s.path.clone()));
             if self.cfg.shuffle {
                 shuffle(&mut songs);
@@ -291,9 +352,67 @@ impl App {
         if !self.cfg.music_folders.contains(&path) {
             self.cfg.music_folders.push(path);
             self.cfg.save();
+            // 文件夹列表变了：缓存签名不可用，本次强制全量
+            self.library_cache_valid = false;
         }
         // 统一走后台重扫，避免大库卡界面
         self.start_scan("正在扫描文件夹…");
+    }
+
+    /// 清除本程序在这台电脑上的所有数据与缓存（含旧版残留），回到全新状态。
+    /// 只删程序专属目录，不碰用户的音乐/歌词文件。停掉后台任务并清空内存状态，
+    /// 避免被清掉的缓存又被 scan/loud 线程写回来。用户随后重新选一次文件夹即可。
+    fn purge_everything(&mut self) {
+        let res = crate::cleanup::purge_all();
+        // 终止在途的后台任务：接收端 drop 后，线程发的消息无人收，自然不会落盘
+        self.scan_rx = None;
+        self.dl_rx = None;
+        self.loud_rx = None;
+        self.browser = None;
+
+        // 清空曲库与所有缓存态
+        self.songs.clear();
+        self.current = None;
+        self.original_order = None;
+        self.library_folders.clear();
+        self.library_cache_valid = false;
+        self.loud_store.items.clear();
+        self.applied_gain = None;
+        if let Some(mpv) = &self.mpv {
+            mpv.stop();
+        }
+        self.lyrics.clear();
+        self.lyric_index = None;
+        self.playing = false;
+        self.eof_guard_until = None;
+        self.ended_for_track = false;
+        self.folder_input.clear();
+
+        // 配置恢复默认：music_folders 清空，下次启动不再沿用失效的旧路径。
+        // 落一份全新的空配置（等价于首次安装）；旧目录已删，会写到新的 hwplayer 目录。
+        self.cfg = Config::default();
+        self.cfg.save();
+
+        self.confirm_purge = false;
+        self.show_settings = false;
+        let n = res.removed.len();
+        let fail = if res.failed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "，{} 处未能删除：{}",
+                res.failed.len(),
+                res.failed
+                    .iter()
+                    .map(|(p, e)| format!("{} ({})", p.display(), e))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            )
+        };
+        self.status = format!(
+            "已清除本程序全部数据（{} 项{}）。请重新选择音乐文件夹。",
+            n, fail
+        );
     }
 
     /// 打乱歌单顺序：直接重排列表本身，下一首就是列表里的下一首
@@ -589,17 +708,18 @@ impl App {
     fn poll_hotkeys(&mut self, ctx: &egui::Context) {
         self.init_hotkeys(ctx);
 
-        // 正在输入框里打字时，方向键归输入框，别拿来切歌/调音量
+        // 正在输入框里打字时，方向键归输入框，别拿来切歌/调音量；
+        // Esc 也一样让给输入框（原生输入框用它取消编辑）。
         let typing = ctx.wants_keyboard_input();
         for a in self.hotkeys.drain() {
             if typing {
                 continue;
             }
-            self.act_hotkey(a);
+            self.act_hotkey(ctx, a);
         }
 
         // 全局热键没生效时（Wayland / 键位被其他程序占用 / 用户关掉）兜底：
-        // 窗口有焦点也能用方向键，功能不至于完全消失。
+        // 窗口有焦点也能用方向键/Esc，功能不至于完全消失。
         if !self.hotkeys.active && !typing {
             let acts = ctx.input(|i| {
                 let mut v: Vec<crate::hotkeys::Action> = Vec::new();
@@ -615,10 +735,13 @@ impl App {
                 if i.key_pressed(egui::Key::ArrowRight) {
                     v.push(crate::hotkeys::Action::Next);
                 }
+                if i.key_pressed(egui::Key::Escape) {
+                    v.push(crate::hotkeys::Action::Quit);
+                }
                 v
             });
             for a in acts {
-                self.act_hotkey(a);
+                self.act_hotkey(ctx, a);
             }
         }
 
@@ -631,7 +754,7 @@ impl App {
         }
     }
 
-    fn act_hotkey(&mut self, a: crate::hotkeys::Action) {
+    fn act_hotkey(&mut self, ctx: &egui::Context, a: crate::hotkeys::Action) {
         let now = Instant::now();
         if let Some(t) = self.hotkey_last[a.slot()] {
             if now.duration_since(t) < a.min_gap() {
@@ -653,6 +776,14 @@ impl App {
             }
             crate::hotkeys::Action::Prev => self.prev(),
             crate::hotkeys::Action::Next => self.next(),
+            crate::hotkeys::Action::Quit => {
+                // 关闭前先落盘音量/设置，避免刚调完音量就按 Esc 丢掉。
+                self.cfg.save();
+                if std::env::var_os("HWPLAYER_DEBUG").is_some() {
+                    eprintln!("[quit] ESC -> close viewport");
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -901,68 +1032,102 @@ impl App {
     // ---------------- 界面 ----------------
 
     fn draw_top(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("音乐文件夹：");
-                let resp = ui.add_sized(
-                    [420.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.folder_input)
-                        .hint_text("输入或粘贴文件夹路径"),
-                );
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        egui::TopBottomPanel::top("top")
+            .frame(
+                egui::Frame::NONE
+                    .fill(crate::theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 11))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(42))),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("♫")
+                            .size(19.0)
+                            .color(crate::theme::MINT),
+                    );
+                    ui.label(
+                        egui::RichText::new("音乐文件夹")
+                            .color(crate::theme::TEXT_DIM),
+                    );
+                    let resp = ui.add_sized(
+                        [420.0, 26.0],
+                        egui::TextEdit::singleline(&mut self.folder_input)
+                            .hint_text("输入或粘贴文件夹路径"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                let picking = self.pick_rx.is_some();
-                if ui
-                    .add_enabled(!picking, egui::Button::new("浏览…"))
-                    .on_hover_text("调用系统自带的文件夹选择器")
-                    .clicked()
-                {
-                    self.start_pick_folder();
-                    ui.ctx().request_repaint();
-                }
-                if ui.button("导入").clicked() || enter {
-                    let p = normalize_input_path(&self.folder_input);
-                    self.folder_input = p.to_string_lossy().into_owned();
-                    self.import_folder(p);
-                }
-                let scanning = self.scan_rx.is_some();
-                if ui
-                    .add_enabled(!scanning, egui::Button::new("重新扫描"))
-                    .clicked()
-                {
-                    self.start_scan("正在重新扫描…");
-                }
-                let downloading = self.dl_rx.is_some();
-                if ui
-                    .add_enabled(!downloading, egui::Button::new("批量下载歌词"))
-                    .clicked()
-                {
-                    self.download_all();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ 设置").clicked() {
-                        self.show_settings = !self.show_settings;
+                    let picking = self.pick_rx.is_some();
+                    if ui
+                        .add_enabled(!picking, egui::Button::new("浏览…"))
+                        .on_hover_text("调用系统自带的文件夹选择器")
+                        .clicked()
+                    {
+                        self.start_pick_folder();
+                        ui.ctx().request_repaint();
                     }
+                    if ui
+                        .add(egui::Button::new("导入").fill(crate::theme::MINT_DIM))
+                        .clicked()
+                        || enter
+                    {
+                        let p = normalize_input_path(&self.folder_input);
+                        self.folder_input = p.to_string_lossy().into_owned();
+                        self.import_folder(p);
+                    }
+                    let scanning = self.scan_rx.is_some();
+                    if ui
+                        .add_enabled(!scanning, egui::Button::new("重新扫描"))
+                        .clicked()
+                    {
+                        self.start_scan("正在重新扫描…");
+                    }
+                    let downloading = self.dl_rx.is_some();
+                    if ui
+                        .add_enabled(!downloading, egui::Button::new("批量下载歌词"))
+                        .clicked()
+                    {
+                        self.download_all();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("⚙ 设置").fill(crate::theme::MINT_DIM))
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
+                        }
+                    });
                 });
             });
-            ui.add_space(6.0);
-        });
     }
 
     fn draw_song_list(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("songs")
             .resizable(true)
             .default_width(340.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(crate::theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(10, 12))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(42))),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("曲库");
-                    ui.label(format!("{} 首", self.songs.len()));
+                    ui.label(
+                        egui::RichText::new("♫ 曲库")
+                            .heading()
+                            .color(crate::theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{} 首", self.songs.len()))
+                            .size(13.0)
+                            .color(crate::theme::MINT),
+                    );
                     if self.cfg.shuffle {
                         ui.label(
                             egui::RichText::new("已打乱")
                                 .size(12.0)
-                                .color(egui::Color32::from_gray(150)),
+                                .color(crate::theme::TEXT_DIM),
                         );
                     }
                 });
@@ -1003,14 +1168,22 @@ impl App {
                 None => ("未播放".to_string(), String::new()),
             };
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                ui.heading(title);
+                ui.label(
+                    egui::RichText::new(&title)
+                        .heading()
+                        .color(crate::theme::TEXT),
+                );
                 if !artist.is_empty() {
-                    ui.label(egui::RichText::new(artist).size(15.0).color(egui::Color32::GRAY));
+                    ui.label(
+                        egui::RichText::new(&artist)
+                            .size(16.0)
+                            .color(crate::theme::MINT),
+                    );
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(14.0);
 
             // 进度条
             let dur = self.duration.max(0.0);
@@ -1040,14 +1213,30 @@ impl App {
             ui.add_space(6.0);
 
             ui.horizontal_wrapped(|ui| {
-                if ui.button("⏮").on_hover_text("上一首").clicked() {
+                if ui
+                    .add(egui::Button::new("⏮").min_size(egui::vec2(38.0, 32.0)))
+                    .on_hover_text("上一首")
+                    .clicked()
+                {
                     self.prev();
                 }
                 let play = if self.playing { "⏸" } else { "▶" };
-                if ui.button(play).on_hover_text("播放/暂停").clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(play).size(18.0))
+                            .fill(crate::theme::MINT)
+                            .min_size(egui::vec2(58.0, 34.0)),
+                    )
+                    .on_hover_text("播放/暂停")
+                    .clicked()
+                {
                     self.toggle_play();
                 }
-                if ui.button("⏭").on_hover_text("下一首").clicked() {
+                if ui
+                    .add(egui::Button::new("⏭").min_size(egui::vec2(38.0, 32.0)))
+                    .on_hover_text("下一首")
+                    .clicked()
+                {
                     self.next();
                 }
 
@@ -1160,7 +1349,17 @@ impl App {
             let trans_color = c32(self.cfg.lyric.translation);
 
             if self.lyrics.is_empty() {
-                ui.label("暂无歌词。点“下载歌词”，或把同名 .lrc 放到音频同目录。");
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("♪  暂无歌词")
+                        .size(15.0)
+                        .color(crate::theme::TEXT_DIM),
+                );
+                ui.label(
+                    egui::RichText::new("点「下载歌词」，或把同名 .lrc 放到音频同目录。")
+                        .size(12.0)
+                        .color(crate::theme::TEXT_FAINT),
+                );
             } else {
                 let mut new_scroll: Option<usize> = None;
                 let mut scroll = egui::ScrollArea::vertical()
@@ -1223,254 +1422,374 @@ impl App {
             return;
         }
         let mut open = self.show_settings;
-        egui::Window::new("设置")
+        egui::Window::new(egui::RichText::new("⚙  设置").color(crate::theme::TEXT).heading())
             .open(&mut open)
-            .default_width(420.0)
+            .default_width(520.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("歌词外观");
-                {
-                    let lw = &mut self.cfg.lyric;
-                    ui.add(
-                        egui::Slider::new(&mut lw.font_size, 16.0..=72.0)
-                            .text("字号")
-                            .suffix(" px"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("已唱颜色");
-                        let mut c = lw.sung;
-                        if ui.color_edit_button_srgb(&mut c).changed() {
-                            lw.sung = c;
-                        }
-                        ui.label("未唱颜色");
-                        let mut c = lw.unsung;
-                        if ui.color_edit_button_srgb(&mut c).changed() {
-                            lw.unsung = c;
-                        }
+                // 顶部标签栏：选项太多，分页放，一页一屏看得完
+                ui.add_space(2.0);
+                egui::Grid::new("settings_tabs")
+                    .num_columns(4)
+                    .spacing([4.0, 0.0])
+                    .show(ui, |ui| {
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Lyrics, "歌词");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Audio, "音效");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Hotkey, "热键");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Library, "曲库与数据");
+                        ui.end_row();
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("翻译颜色");
-                        let mut c = lw.translation;
-                        if ui.color_edit_button_srgb(&mut c).changed() {
-                            lw.translation = c;
-                        }
-                    });
-                    let mut alpha_pct = lw.background_alpha as f32 / 255.0 * 100.0;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut alpha_pct, 0.0..=100.0)
-                                .text("歌词窗背景")
-                                .suffix(" %"),
-                        )
-                        .changed()
-                    {
-                        lw.background_alpha = (alpha_pct / 100.0 * 255.0).round() as u8;
-                    }
-                    ui.checkbox(&mut lw.show_translation, "显示翻译");
-                    ui.checkbox(&mut lw.show_next, "显示下一句");
-                    ui.add(
-                        egui::Slider::new(&mut lw.width, 320.0..=2400.0)
-                            .text("歌词窗宽度")
-                            .suffix(" px"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut lw.height, 70.0..=500.0)
-                            .text("歌词窗高度")
-                            .suffix(" px"),
-                    );
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                match self.settings_tab {
+                    SettingsTab::Lyrics => self.settings_lyrics(ui),
+                    SettingsTab::Audio => self.settings_audio(ui),
+                    SettingsTab::Hotkey => self.settings_hotkey(ui, ctx),
+                    SettingsTab::Library => self.settings_library(ui),
                 }
 
+                ui.add_space(6.0);
                 ui.separator();
-                ui.heading("歌词源顺序");
-                ui.label(
-                    egui::RichText::new("按顺序尝试，命中高分的源就直接用；分数不够再往下找。")
-                        .size(12.0)
-                        .color(egui::Color32::from_gray(150)),
-                );
-                let mut swap: Option<(usize, usize)> = None;
-                let len = self.cfg.source_order.len();
-                for i in 0..len {
-                    let id = self.cfg.source_order[i].clone();
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}. {}", i + 1, lyrics_online::source_label(&id)));
-                        if i > 0 && ui.small_button("↑").clicked() {
-                            swap = Some((i, i - 1));
-                        }
-                        if i + 1 < len && ui.small_button("↓").clicked() {
-                            swap = Some((i, i + 1));
-                        }
-                    });
-                }
-                if let Some((a, b)) = swap {
-                    self.cfg.source_order.swap(a, b);
-                    self.cfg.save();
-                }
-
-                ui.separator();
-                ui.heading("等响度（ReplayGain）");
-                ui.label(
-                    egui::RichText::new(
-                        "把每首歌的响度拉到同一水平。先看文件里的 ReplayGain 标签，没有就本地测：\
-                        解码 → K 加权（38Hz 高通 + 1.5kHz +4dB 高架）→ 400ms 窗口 RMS → \
-                        95 分位 → 目标响度 − 实测。默认只衰减不放大（上限 −1 dBFS），要抬音量得手动允许。",
-                    )
-                    .size(12.0)
-                    .color(egui::Color32::from_gray(150)),
-                );
-                let mut loud_changed = false;
-                {
-                    let lc = &mut self.cfg.loudness;
-                    loud_changed |= ui.checkbox(&mut lc.enabled, "启用等响度").changed();
-                    loud_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut lc.target_db, -26.0..=-12.0)
-                                .text("目标响度")
-                                .suffix(" dBFS"),
-                        )
-                        .changed();
-                    loud_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut lc.preamp_db, -12.0..=12.0)
-                                .text("预增益")
-                                .suffix(" dB"),
-                        )
-                        .changed();
-                    loud_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut lc.missing_gain_db, -12.0..=12.0)
-                                .text("无数据时的缺省增益")
-                                .suffix(" dB"),
-                        )
-                        .changed();
-                    loud_changed |= ui
-                        .checkbox(&mut lc.peak_protection, "峰值保护（用测量峰值限制增益，避免削波）")
-                        .changed();
-                    loud_changed |= ui
-                        .checkbox(
-                            &mut lc.allow_boost,
-                            "允许正向放大（关闭时只衰减，保留 1 dB 余量）",
-                        )
-                        .on_hover_text(
-                            "关闭（推荐）：mp3gain 式只压不抬。安静的歌不会被抬到底噪、也不会削波，\
-                             整体再留 1 dB 余量给 EQ 和系统混音。\n\
-                             打开：完整 ReplayGain 对齐，安静曲目抬到目标响度，但底噪同步变大，\
-                             峰值数据不准时会削波。",
-                        )
-                        .changed();
-                    loud_changed |= ui
-                        .checkbox(&mut lc.auto_analyze, "没有标签时自动现场测量（播放时后台跑）")
-                        .changed();
-                    loud_changed |= ui.checkbox(&mut lc.album_mode, "优先使用专辑增益").changed();
-                    loud_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut lc.max_analyze_sec, 15..=300)
-                                .text("每首最多解码")
-                                .suffix(" 秒"),
-                        )
-                        .changed();
-                }
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let running = self.loud_rx.is_some();
                     if ui
-                        .add_enabled(!running && !self.songs.is_empty(), egui::Button::new("扫描全库响度"))
-                        .on_hover_text("只测还没测过的，边测边存，可以随时关掉下次接着测")
+                        .add(
+                            egui::Button::new("保存设置")
+                                .fill(crate::theme::MINT_DIM)
+                                .min_size(egui::vec2(100.0, 30.0)),
+                        )
                         .clicked()
                     {
-                        self.start_loud_scan();
-                    }
-                    if ui
-                        .add_enabled(!running && !self.loud_store.is_empty(), egui::Button::new("清除测量结果"))
-                        .clicked()
-                    {
-                        self.loud_store.items.clear();
-                        self.loud_store.save();
-                        self.status = "已清除响度测量结果。".to_string();
-                        if let Some(i) = self.current {
-                            let s = self.songs[i].clone();
-                            self.apply_gain(&s);
-                        }
-                    }
-                    ui.label(format!("已测 {} 首", self.loud_store.len()));
-                    if let Some(g) = self.applied_gain {
-                        ui.label(format!("当前：{:+.1} dB", g));
+                        self.cfg.save();
+                        self.status = "设置已保存。".to_string();
                     }
                 });
-                if loud_changed {
-                    self.cfg.save();
-                    if let Some(i) = self.current {
-                        let s = self.songs[i].clone();
-                        self.apply_gain(&s);
-                    }
-                }
-
-                ui.separator();
-                ui.heading("全局热键");
-                ui.label(
-                    egui::RichText::new(
-                        "↑ 音量加，↓ 音量减，← 上一首，→ 下一首。X11 下用 XGrabKey 注册，\
-                         窗口不在前台也生效。注意：运行期间方向键会被本程序独占，\
-                         其他程序收不到方向键，不需要时请关掉（关掉后仅在窗口内可用）。",
-                    )
-                    .size(12.0)
-                    .color(egui::Color32::from_gray(150)),
-                );
-                let mut hk_on = self.cfg.hotkey_enabled;
-                if ui.checkbox(&mut hk_on, "启用全局方向键热键").changed() {
-                    self.cfg.hotkey_enabled = hk_on;
-                    self.hotkeys = crate::hotkeys::Hotkeys::install(ctx, hk_on);
-                    self.cfg.save();
-                }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.cfg.hotkey_volume_step, 1.0..=20.0)
-                            .text("每次调整")
-                            .suffix(" %"),
-                    )
-                    .changed()
-                {
-                    self.cfg.save();
-                }
-                ui.label(
-                    egui::RichText::new(format!(
-                        "状态：{}｜当前音量 {:.0}%",
-                        self.hotkeys.status, self.cfg.volume
-                    ))
-                    .size(12.0)
-                    .color(egui::Color32::from_gray(170)),
-                );
-
-                ui.separator();
-                if ui
-                    .checkbox(&mut self.cfg.rescan_on_start, "启动时自动重新扫描文件夹")
-                    .changed()
-                {
-                    self.cfg.save();
-                }
-                if ui.button("保存设置").clicked() {
-                    self.cfg.save();
-                    self.status = "设置已保存。".to_string();
-                }
             });
         self.show_settings = open;
     }
 
-    fn draw_status(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+    // ---------------- 设置页：歌词 ----------------
+    fn settings_lyrics(&mut self, ui: &mut egui::Ui) {
+        ui.heading("歌词外观");
+        {
+            let lw = &mut self.cfg.lyric;
+            ui.add(
+                egui::Slider::new(&mut lw.font_size, 16.0..=72.0)
+                    .text("字号")
+                    .suffix(" px"),
+            );
             ui.horizontal(|ui| {
-                ui.label(self.status.clone());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(err) = &self.mpv_err {
-                        ui.colored_label(egui::Color32::LIGHT_RED, err.as_str());
-                    } else {
-                        ui.label(
-                            egui::RichText::new("libmpv ✓")
-                                .size(12.0)
-                                .color(egui::Color32::from_gray(140)),
-                        );
-                    }
+                ui.label("已唱颜色");
+                let mut c = lw.sung;
+                if ui.color_edit_button_srgb(&mut c).changed() {
+                    lw.sung = c;
+                }
+                ui.label("未唱颜色");
+                let mut c = lw.unsung;
+                if ui.color_edit_button_srgb(&mut c).changed() {
+                    lw.unsung = c;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("翻译颜色");
+                let mut c = lw.translation;
+                if ui.color_edit_button_srgb(&mut c).changed() {
+                    lw.translation = c;
+                }
+            });
+            let mut alpha_pct = lw.background_alpha as f32 / 255.0 * 100.0;
+            if ui
+                .add(
+                    egui::Slider::new(&mut alpha_pct, 0.0..=100.0)
+                        .text("歌词窗背景")
+                        .suffix(" %"),
+                )
+                .changed()
+            {
+                lw.background_alpha = (alpha_pct / 100.0 * 255.0).round() as u8;
+            }
+            ui.checkbox(&mut lw.show_translation, "显示翻译");
+            ui.checkbox(&mut lw.show_next, "显示下一句");
+            ui.add(
+                egui::Slider::new(&mut lw.width, 320.0..=2400.0)
+                    .text("歌词窗宽度")
+                    .suffix(" px"),
+            );
+            ui.add(
+                egui::Slider::new(&mut lw.height, 70.0..=500.0)
+                    .text("歌词窗高度")
+                    .suffix(" px"),
+            );
+        }
+
+        ui.separator();
+        ui.heading("歌词源顺序");
+        ui.label(
+            egui::RichText::new("按顺序尝试，命中高分的源就直接用；分数不够再往下找。")
+                .size(12.0)
+                .color(egui::Color32::from_gray(150)),
+        );
+        let mut swap: Option<(usize, usize)> = None;
+        let len = self.cfg.source_order.len();
+        for i in 0..len {
+            let id = self.cfg.source_order[i].clone();
+            ui.horizontal(|ui| {
+                ui.label(format!("{}. {}", i + 1, lyrics_online::source_label(&id)));
+                if i > 0 && ui.small_button("↑").clicked() {
+                    swap = Some((i, i - 1));
+                }
+                if i + 1 < len && ui.small_button("↓").clicked() {
+                    swap = Some((i, i + 1));
+                }
+            });
+        }
+        if let Some((a, b)) = swap {
+            self.cfg.source_order.swap(a, b);
+            self.cfg.save();
+        }
+    }
+
+    // ---------------- 设置页：音效（等响度） ----------------
+    fn settings_audio(&mut self, ui: &mut egui::Ui) {
+        ui.heading("等响度（ReplayGain）");
+        ui.label(
+            egui::RichText::new(
+                "把每首歌的响度拉到同一水平。先看文件里的 ReplayGain 标签，没有就本地测：\
+                解码 → K 加权（38Hz 高通 + 1.5kHz +4dB 高架）→ 400ms 窗口 RMS → \
+                95 分位 → 目标响度 − 实测。默认只衰减不放大（上限 −1 dBFS），要抬音量得手动允许。",
+            )
+            .size(12.0)
+            .color(egui::Color32::from_gray(150)),
+        );
+        let mut loud_changed = false;
+        {
+            let lc = &mut self.cfg.loudness;
+            loud_changed |= ui.checkbox(&mut lc.enabled, "启用等响度").changed();
+            loud_changed |= ui
+                .add(
+                    egui::Slider::new(&mut lc.target_db, -26.0..=-12.0)
+                        .text("目标响度")
+                        .suffix(" dBFS"),
+                )
+                .changed();
+            loud_changed |= ui
+                .add(
+                    egui::Slider::new(&mut lc.preamp_db, -12.0..=12.0)
+                        .text("预增益")
+                        .suffix(" dB"),
+                )
+                .changed();
+            loud_changed |= ui
+                .add(
+                    egui::Slider::new(&mut lc.missing_gain_db, -12.0..=12.0)
+                        .text("无数据时的缺省增益")
+                        .suffix(" dB"),
+                )
+                .changed();
+            loud_changed |= ui
+                .checkbox(&mut lc.peak_protection, "峰值保护（用测量峰值限制增益，避免削波）")
+                .changed();
+            loud_changed |= ui
+                .checkbox(
+                    &mut lc.allow_boost,
+                    "允许正向放大（关闭时只衰减，保留 1 dB 余量）",
+                )
+                .on_hover_text(
+                    "关闭（推荐）：mp3gain 式只压不抬。安静的歌不会被抬到底噪、也不会削波，\
+                     整体再留 1 dB 余量给 EQ 和系统混音。\n\
+                     打开：完整 ReplayGain 对齐，安静曲目抬到目标响度，但底噪同步变大，\
+                     峰值数据不准时会削波。",
+                )
+                .changed();
+            loud_changed |= ui
+                .checkbox(&mut lc.auto_analyze, "没有标签时自动现场测量（播放时后台跑）")
+                .changed();
+            loud_changed |= ui.checkbox(&mut lc.album_mode, "优先使用专辑增益").changed();
+            loud_changed |= ui
+                .add(
+                    egui::Slider::new(&mut lc.max_analyze_sec, 15..=300)
+                        .text("每首最多解码")
+                        .suffix(" 秒"),
+                )
+                .changed();
+        }
+        ui.horizontal(|ui| {
+            let running = self.loud_rx.is_some();
+            if ui
+                .add_enabled(!running && !self.songs.is_empty(), egui::Button::new("扫描全库响度"))
+                .on_hover_text("只测还没测过的，边测边存，可以随时关掉下次接着测")
+                .clicked()
+            {
+                self.start_loud_scan();
+            }
+            if ui
+                .add_enabled(!running && !self.loud_store.is_empty(), egui::Button::new("清除测量结果"))
+                .clicked()
+            {
+                self.loud_store.items.clear();
+                self.loud_store.save();
+                self.status = "已清除响度测量结果。".to_string();
+                if let Some(i) = self.current {
+                    let s = self.songs[i].clone();
+                    self.apply_gain(&s);
+                }
+            }
+            ui.label(format!("已测 {} 首", self.loud_store.len()));
+            if let Some(g) = self.applied_gain {
+                ui.label(format!("当前：{:+.1} dB", g));
+            }
+        });
+        if loud_changed {
+            self.cfg.save();
+            if let Some(i) = self.current {
+                let s = self.songs[i].clone();
+                self.apply_gain(&s);
+            }
+        }
+    }
+
+    // ---------------- 设置页：全局热键 ----------------
+    fn settings_hotkey(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("全局热键");
+        ui.label(
+            egui::RichText::new(
+                "↑ 音量加，↓ 音量减，← 上一首，→ 下一首，Esc 退出程序。\
+                 X11 下用 XGrabKey 注册，窗口不在前台也生效。\
+                 注意：运行期间这些键会被本程序独占，其他程序收不到；\
+                 不需要时请关掉（关掉后仅在窗口内可用）。",
+            )
+            .size(12.0)
+            .color(egui::Color32::from_gray(150)),
+        );
+        let mut hk_on = self.cfg.hotkey_enabled;
+        if ui.checkbox(&mut hk_on, "启用全局热键（方向键 + Esc）").changed() {
+            self.cfg.hotkey_enabled = hk_on;
+            self.hotkeys = crate::hotkeys::Hotkeys::install(ctx, hk_on);
+            self.cfg.save();
+        }
+        if ui
+            .add(
+                egui::Slider::new(&mut self.cfg.hotkey_volume_step, 1.0..=20.0)
+                    .text("每次调整")
+                    .suffix(" %"),
+            )
+            .changed()
+        {
+            self.cfg.save();
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "状态：{}｜当前音量 {:.0}%",
+                self.hotkeys.status, self.cfg.volume
+            ))
+            .size(12.0)
+            .color(egui::Color32::from_gray(170)),
+        );
+    }
+
+    // ---------------- 设置页：曲库与数据 ----------------
+    fn settings_library(&mut self, ui: &mut egui::Ui) {
+        ui.heading("曲库缓存");
+        if ui
+            .checkbox(
+                &mut self.cfg.rescan_on_start,
+                "启动时后台增量刷新曲库（列表会先用上次的缓存秒开）",
+            )
+            .changed()
+        {
+            self.cfg.save();
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "曲库缓存：{} 首｜改文件夹或增删歌曲后会自动更新",
+                self.songs.len()
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_gray(140)),
+        );
+
+        ui.separator();
+        ui.heading("清除本程序数据");
+        ui.label(
+            egui::RichText::new(
+                "换过电脑、删过旧版本，或怎么选文件夹都读不到歌时，用这里把本程序\
+                 保存的配置、曲库缓存、响度测量和旧版残留全部清空，恢复到首次安装状态。\
+                 只会删除本程序自己的数据目录，不会删除你的音乐和歌词文件。",
+            )
+            .size(12.0)
+            .color(egui::Color32::from_gray(150)),
+        );
+        // 展示将要删除的实际路径，让用户心里有数
+        let existing = crate::cleanup::existing_data_dirs();
+        if existing.is_empty() {
+            ui.label(
+                egui::RichText::new("（当前没有可清除的程序数据）")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(130)),
+            );
+        } else {
+            for p in &existing {
+                ui.label(
+                    egui::RichText::new(format!("  · {}", p.display()))
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(160)),
+                );
+            }
+        }
+        if !self.confirm_purge {
+            if ui
+                .button("清除本程序的所有数据与缓存…")
+                .on_hover_text("删除配置/缓存/旧版残留；不会删除音乐文件")
+                .clicked()
+            {
+                self.confirm_purge = true;
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 170, 90),
+                    "确定清除？此操作不可撤销。",
+                );
+                if ui.button("确认清除").clicked() {
+                    self.purge_everything();
+                }
+                if ui.button("取消").clicked() {
+                    self.confirm_purge = false;
+                }
+            });
+        }
+    }
+
+    fn draw_status(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::NONE
+                    .fill(crate::theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 7))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(36))),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .size(12.0)
+                            .color(crate::theme::TEXT_DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(err) = &self.mpv_err {
+                            ui.colored_label(egui::Color32::LIGHT_RED, err.as_str());
+                        } else {
+                            ui.label(
+                                egui::RichText::new("libmpv ✓")
+                                    .size(12.0)
+                                    .color(crate::theme::MINT_DIM),
+                            );
+                        }
+                    });
                 });
             });
-        });
     }
 
     /// 内置目录浏览器：系统没有 zenity/kdialog 时的兜底，纯 egui 实现、零外部依赖
@@ -1483,7 +1802,11 @@ impl App {
         let mut nav: Option<PathBuf> = None;
         let mut chosen: Option<PathBuf> = None;
 
-        egui::Window::new("选择音乐文件夹")
+        egui::Window::new(
+            egui::RichText::new("📁  选择音乐文件夹")
+                .color(crate::theme::TEXT)
+                .heading(),
+        )
             .collapsible(false)
             .resizable(true)
             .default_size([540.0, 440.0])

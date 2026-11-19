@@ -738,6 +738,7 @@ mod e2e_tests {
             artist: "a".into(),
             album: "b".into(),
             duration_ms: 1000,
+            sig: Default::default(),
         };
         let mut store = Store::default();
         store.put(

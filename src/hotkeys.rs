@@ -1,4 +1,4 @@
-//! 全局热键：↑/↓ 音量，←/→ 切歌。
+//! 全局热键：↑/↓ 音量，←/→ 切歌，Esc 退出。
 //!
 //! 做法照搬 `744733778/txt-reader` 在 Linux 上的实现：
 //! `global-hotkey` 0.6 在 X11 下用 `XGrabKey` 注册，不需要 root、不用常驻守护进程；
@@ -21,6 +21,7 @@ pub enum Action {
     VolumeDown,
     Prev,
     Next,
+    Quit,
 }
 
 impl Action {
@@ -31,27 +32,31 @@ impl Action {
             Action::VolumeDown => 1,
             Action::Prev => 2,
             Action::Next => 3,
+            Action::Quit => 4,
         }
     }
 
     /// 连按去抖：切歌必须比音量更钝，否则按住 ←/→ 的自动重复会连跳十几首。
+    /// 退出给更长间隔，避免长按 Esc 时反复触发关闭。
     pub fn min_gap(self) -> Duration {
         match self {
             Action::Prev | Action::Next => Duration::from_millis(220),
             Action::VolumeUp | Action::VolumeDown => Duration::from_millis(45),
+            Action::Quit => Duration::from_millis(500),
         }
     }
 }
 
 /// 固定键位。顺序即注册顺序，方便日志排查。
-const BINDINGS: [(Code, Action); 4] = [
+const BINDINGS: [(Code, Action); 5] = [
     (Code::ArrowUp, Action::VolumeUp),
     (Code::ArrowDown, Action::VolumeDown),
     (Code::ArrowLeft, Action::Prev),
     (Code::ArrowRight, Action::Next),
+    (Code::Escape, Action::Quit),
 ];
 
-pub const HINT: &str = "↑/↓ 音量 · ←/→ 切歌";
+pub const HINT: &str = "↑/↓ 音量 · ←/→ 切歌 · Esc 退出";
 
 pub struct Hotkeys {
     /// 持有它才算保持注册；Drop 时自动注销

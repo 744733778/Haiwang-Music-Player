@@ -266,6 +266,7 @@ mod tests {
             artist: artist.into(),
             album: album.into(),
             duration_ms: dur,
+            sig: Default::default(),
         }
     }
 

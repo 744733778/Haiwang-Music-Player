@@ -14,14 +14,14 @@
 | 文件 | 说明 |
 |------|------|
 | `artifacts/hwplayer-x86_64.AppImage` | **主交付物**：可直接在银河麒麟上运行的 AppImage（约 87MB，已内置 libmpv/ffmpeg、GTK/XCB 依赖、中文字体）|
-| `artifacts/hwplayer_0.1.0-6_amd64.deb` | **deb 离线自包含安装包**（约 78MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
+| `artifacts/hwplayer_0.1.0-11_amd64.deb` | **deb 离线自包含安装包**（约 72MB）：libmpv+ffmpeg 全链、X11/xcb/wayland、字体栈、alsa/jack 等运行时库均内置到 `/opt/hwplayer`；离线机 `dpkg -i` 即可装（Depends 仅需 glibc/libgcc/显卡驱动栈）|
 | `artifacts/hwplayer` | 编译出的原始 ELF（未打包 glibc，最高 GLIBC 需求 2.30 ≤ 2.31）|
 | `artifacts/glibc_check.txt` | GLIBC 版本需求校验结论（兼容麒麟）|
 | `assets/linuxdeploy-x86_64.AppImage` | 离线打包工具（linuxdeploy）|
 | `assets/runtime-x86_64` | 离线 type2 runtime（appimagetool 打包用，免联网下载）|
 | `assets/icon.png` / `icon_256.png` | 程序图标（256x256 为 AppImage 规范所需尺寸）|
 
-> **版本说明**：`0.1.0-6` 移植了上游 `BYD-AplayerFoliaMix` 的「**等响度安全增益**」修复：默认只衰减、不放大，并保留 1 dB 余量，解决安静歌曲被抬高底噪 / 削波产生的「沙沙」声；同时移植 `txt-reader` 的 Linux 全局热键方案，`↑/↓` 调音量、`←/→` 切歌，窗口不在前台也生效。详见下方[更新记录](#更新记录)。
+> **版本说明**：`0.1.0-11` UI 美化为深色+薄荷绿主题；`0.1.0-10` 设置窗口改为四标签分页；`0.1.0-9` 新增「一键清除程序数据」按钮（解决换机/旧版残留导致读不到歌）；`0.1.0-8` 修复「打开很慢」——播放列表现在会缓存到 `~/.config/hwplayer/library.json`，启动时**秒开显示上次的曲库**，后台再做增量扫描（只对新增/改动文件读标签）。`0.1.0-7` 增加了 `Esc` 全局退出热键；`0.1.0-6` 移植了等响度安全增益。详见下方[更新记录](#更新记录)。
 
 > **兼容性结论**：主程序最高仅需求 `GLIBC_2.30`，低于麒麟 V10 SP1 的 `glibc 2.31`；AppImage **未打包 glibc**（运行时使用系统 glibc），符合发行版兼容目标。
 
@@ -52,10 +52,10 @@ chmod +x hwplayer-x86_64.AppImage
 
 ```bash
 # 离线机直接安装（Depends 仅需 glibc/libgcc/显卡驱动栈，桌面机均已具备）
-sudo dpkg -i hwplayer_0.1.0-6_amd64.deb
+sudo dpkg -i hwplayer_0.1.0-11_amd64.deb
 
 # 也可用 apt（本地文件）
-sudo apt install ./hwplayer_0.1.0-6_amd64.deb
+sudo apt install ./hwplayer_0.1.0-11_amd64.deb
 
 # 运行：应用菜单「海王音乐播放器」，或命令行
 hwplayer
@@ -101,7 +101,7 @@ haiwang/
 │   └── patch_eframe.py         # (备查) 曾尝试彻底移除 egui-wgpu 的方案，最终因 eframe 需 edition2024 未采用
 └── artifacts/                  # 构建产物与日志
     ├── hwplayer-x86_64.AppImage
-    ├── hwplayer_0.1.0-6_amd64.deb
+    ├── hwplayer_0.1.0-11_amd64.deb
     ├── hwplayer
     ├── glibc_check.txt
     └── *.log
@@ -111,7 +111,77 @@ haiwang/
 
 ## 更新记录
 
-### 0.1.0-6（当前）
+### 0.1.0-11（当前）
+
+**UI 视觉美化**：参考 LX Music（Fluent Dark）与 YesPlayMusic，换成深色炭灰 +
+薄荷绿主题——圆角卡片、主按钮薄荷绿高亮、选中项高亮、层次更清晰。功能逻辑
+一行未改，桌面歌词窗颜色仍由你在设置里自定义。
+
+### 0.1.0-10
+
+设置窗口改为**顶部标签分页**：选项太多堆一页要一直往下滚，现在分成四页——
+「歌词」（外观 + 歌词源顺序）、「音效」（等响度）、「热键」（方向键/Esc）、
+「曲库与数据」（缓存开关 + 一键清除数据）。每页一屏看得完，底部「保存设置」
+常驻。原有选项全部保留，只是重新分组。
+
+### 0.1.0-9
+
+新增「清除本程序数据」设置按钮，解决换机/删过旧版本后怎么选文件夹都读不到歌。
+
+**原因**：程序改过名字（`rust-music` → `hwplayer`），为兼容旧版，只要新目录
+没有 `config.json` 就一直沿用 `~/.config/rust-music/`。残留的旧配置或坏掉的
+曲库缓存会让文件夹选择看起来「没反应」。
+
+**用法**：打开 ⚙ 设置 → 最底部「清除本程序数据」→ 先看到将删除的目录清单
+（`~/.config/hwplayer`、`~/.config/rust-music` 及 cache/data 下同名目录），点一次
+进入确认态，再点「确认清除」即执行。清除后回到主界面重新选一次音乐文件夹即可，
+等价于全新安装。
+
+**安全边界**：只删程序自己的数据目录；你的音乐文件、歌词文件一个都不碰，
+程序本体也不卸载（deb 用 `apt remove hwplayer`，AppImage 直接删文件）。
+
+### 0.1.0-8
+
+修复「每次打开都要重新扫描、启动很慢」。
+
+先说结论：扫描本身一直在**后台线程**跑，不会卡住界面；真正让人觉得慢的是
+**播放列表从不保存**——每次启动列表都是空的，`rescan_on_start` 打开就全量重扫，
+每首歌都要 `lofty::read_from_path()` 打开文件读标签和时长。曲库一大，列表要等
+扫描跑完才出现。关掉这个开关更糟：列表永远是空的。
+
+改法（就是「先打开上次的列表，后台慢慢扫」）：
+
+1. **列表缓存**：扫描结果存到 `~/.config/hwplayer/library.json`（含每首歌的
+   `路径 + 标题/作者/专辑/时长 + 文件签名(大小+mtime)`）。启动时**立即读回并
+   显示**，列表秒开、可以马上播放。写盘用「临时文件 + rename」原子替换，避免
+   中途断电写出半个 JSON。
+2. **后台增量扫描**：签名未变的文件直接复用缓存里的标签，只有新增/改动的文件
+   才读 lofty；磁盘上已删除的文件会被剔除。400 首全不变的库，扫描从「400 次
+   标签解析」降到「400 次 stat」。文件夹列表变化时强制全量，避免残留已删目录的歌。
+3. `HWPLAYER_DEBUG=1` 会打印 `[scan] 耗时, N songs (old cache M)`，方便自查。
+
+实测（容器内 400 首）：第二次启动 1 秒内列表已完整显示 400 首、状态栏「扫描
+完成」；删 5 首加 2 首后增量扫描结果为 397 首，增删都被正确识别。
+
+> 设置项文案相应改为「启动时后台增量刷新曲库（列表会先用上次的缓存秒开）」。
+> 首次运行没有缓存时仍需全量扫一次；之后启动都是秒开。
+
+### 0.1.0-7
+
+新增全局 **`Esc` 退出程序**热键，与方向键共用同一套 `global-hotkey 0.6`（X11
+`XGrabKey`）机制：窗口失焦、最小化、别的程序在前台时按 Esc 都能退出；全局注册
+失败（Wayland / 键位被占）时自动退回「窗口内 Esc」。
+
+- 退出前先把音量/设置写入 `~/.config/hwplayer/config.json`，避免刚调完音量就按
+  Esc 丢掉改动。
+- 输入框聚焦时 Esc 归输入框（保留原生「取消编辑」行为），不会误退出整个程序。
+- 去抖 500 ms，长按 Esc 不会反复触发关闭。
+- 设置面板文案同步为「启用全局热键（方向键 + Esc）」，状态栏照常显示注册情况。
+
+> 提醒：`Esc` 同样是无修饰键，运行期间会被本程序独占，其他程序收不到。不需要时
+> 到「设置 → 全局热键」关掉，关掉后只在窗口内生效。
+
+### 0.1.0-6
 
 本版把上游两个项目的新改动移植过来：`BYD-AplayerFoliaMix` 的等响度安全增益，
 `txt-reader` 的 Linux 全局热键。
@@ -287,7 +357,7 @@ docker run --rm -v "$PWD/out:/out" ubuntu:20.04 bash -c '
   bash /scripts/collect_libs.sh /out/libset /out/wqy-zenhei.ttc'   # 需挂载 scripts/
 # 2) 用该库集装配离线 deb（宿主执行即可）
 LIB_SRC="$PWD/out/libset" FONT_SRC="$PWD/out/wqy-zenhei.ttc" bash scripts/build_deb.sh
-# 产物: artifacts/hwplayer_0.1.0-6_amd64.deb
+# 产物: artifacts/hwplayer_0.1.0-11_amd64.deb
 ```
 
 ---

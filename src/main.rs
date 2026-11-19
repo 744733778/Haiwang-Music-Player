@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cleanup;
 mod config;
 mod hotkeys;
 mod library;
@@ -10,6 +11,7 @@ mod lyrics_online;
 #[cfg(windows)]
 mod lyric_win32;
 mod mpv;
+mod theme;
 
 use eframe::egui;
 
@@ -38,6 +40,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx);
             Ok(Box::new(app::App::new(cfg)))
         }),
     )
